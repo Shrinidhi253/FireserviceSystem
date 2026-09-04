@@ -1,93 +1,56 @@
-# DIT357_LAB
+# DIT357 Lab Template — Fighting Forest Fires with Distributed Messaging
 
+![Fighting forest fires](firetrucks_comic.png)
 
+## About
+This repository is the starting point for the DIT357 Distributed Systems lab "Fighting Forest Fires with Distributed Messaging". You will build a decentralised system where independent fire trucks coordinate (without the help of a central controller) to extinguish fires spreading across a 20×20 grid, using TCP, NATS request-reply, NATS publish-subscribe, and Lamport logical clocks along the way.
+
+The full lab specification [DIT357_Lab.pdf](DIT357_Lab.pdf) is the source for every task's requirements and deliverables. This **README** covers how to get the template running and how the repository is organised and it does **NOT** replace the lab's PDF.
 
 ## Getting started
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+Fork this repository into your own group's space (or clone it directly, depending on how your group is set up).
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+1. Clone your fork:
 
-## Add your files
-
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
-
-```
-cd existing_repo
-git remote add origin https://git.chalmers.se/heyn/dit357_lab.git
-git branch -M main
-git push -uf origin main
+```bash
+   git clone https://git.chalmers.se/heyn/dit357_lab
+   cd <directory-name>
 ```
 
-## Integrate with your tools
+2. Run the Part 0 template:
+```bash
+   go run task-0-template.go
+```
+You should see a 20×20 grid redrawing in place roughly every 0.6 seconds, with two trucks roaming the grid and fighting fires.
 
-* [Set up project integrations](https://git.chalmers.se/heyn/dit357_lab/-/settings/integrations)
+No code changes are required to complete Part 0. The template is a complete and working simulation on its own. Part 0 is about reading and understanding it (see below), not extending it. Your own code starts in Part 1.
 
-## Collaborate with your team
+## What's in the template
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+**task-0-template.go** implements, as a single sequential Go program:
 
-## Test and Deploy
+- 20×20 grid where cell (0,0) is the fire department and fires cannot ignite
+- fires that ignite at random, intensify over time, and periodically spread to their neighbouring cells
+- two trucks that move around the grid, seek out the nearest fire, and extinguish it by spending on-board water;
+- a truck that runs out of water heading back to the fire department and idling there - refilling is not implemented
+- a console renderer that redraws the grid in place each timestep.
 
-Use the built-in continuous integration in GitLab.
+All the tunable simulation constants (grid size, how often fires spread and intensify, truck water capacity, refill rate, number of trucks, etc.) are declared together near the top of the file and are documented there.
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
+There is no messaging or networking of any kind in the Part 0 template — that is intentional. It exists as the centralised, single-process baseline that the rest of the lab pulls apart into an actual distributed system.
 
-***
+## Lab structure
 
-# Editing this README
+The lab is split into six parts. Part 0 uses this template as-is; Parts 1–4 build the distributed system on top of it in stages; Part 5 is your final presentation and demo. See [DIT357_Lab.pdf](DIT357_Lab.pdf) for full task descriptions, diagrams, and deliverables for each part.
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+- Part 0 (Est. time ~2 h) - Read and understand the provided template. No code changes.
+- Part 1 (Est. time ~8 h) - Design and implement an application-layer protocol over raw TCP so trucks can request water refills from a fire-department server.
+- Part 2 (Est. time ~6 h) - Capture your Part 1 protocol's traffic with Wireshark and connect it to what you know about TCP from the lectures.
+- Part 3 (Est. time ~12 h) - Migrate the refill channel to NATS request-reply; design a naming scheme for trucks and fire locations; implement a decentralised, NATS publish-subscribe "call for help" protocol so trucks can coordinate on big fires without a central decision-maker; add on-demand truck deployment and fuel-saving behaviour.
+- Part 4 (Est. time ~6 h) - Add Lamport logical clocks so the fire department grants the shared water reservoir fairly, in "who asked first" order.
+- Part 5 (Est. time ~6 h) - Present your architecture and design decisions, with a live demo.
 
-## Suggestions for a good README
+## Getting help
+If you have any questions or get stuck at any point, contact your assigned TA.
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
-
-## Name
-Choose a self-explaining name for your project.
-
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
-
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
-
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
-
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
-
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
-
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
-
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
