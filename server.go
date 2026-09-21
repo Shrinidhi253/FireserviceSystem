@@ -18,10 +18,13 @@ type RefillRequest struct {
 }
 
 type FireDeptServer struct {
-	mu           sync.Mutex
-	isBusy       bool
-	currentTruck string
-	queue        []RefillRequest
+	mu                sync.Mutex
+	isBusy            bool
+	currentTruck      string
+	currentTruckX     int
+	currentTruckY     int
+	currentTruckWater int
+	queue             []RefillRequest
 }
 
 func NewFireDeptServer() *FireDeptServer {
