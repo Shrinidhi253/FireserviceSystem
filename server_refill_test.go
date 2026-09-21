@@ -2,51 +2,50 @@ package main
 
 import "testing"
 
-// Covers the four acceptance criteria of issue #8 in isolation.
-
 func TestTickRefill_OnlyActsWhenBusy(t *testing.T) {
-	st := &ServedTruck{X: DeptX, Y: DeptY, Water: 3, Status: FREE}
-	st.TickRefill()
-	if st.Water != 3 {
-		t.Errorf("expected water unchanged while FREE, got %d", st.Water)
+	s := &FireDeptServer{isBusy: false, currentTruckX: DeptX, currentTruckY: DeptY, currentTruckWater: 3}
+	s.TickRefill()
+	if s.currentTruckWater != 3 {
+		t.Errorf("expected water unchanged while not busy, got %d", s.currentTruckWater)
 	}
 }
 
 func TestTickRefill_IncreasesByZAtDepot(t *testing.T) {
-	st := &ServedTruck{X: DeptX, Y: DeptY, Water: 2, Status: BUSY}
-	st.TickRefill()
-	if st.Water != 2+RefillRate {
-		t.Errorf("expected water = %d, got %d", 2+RefillRate, st.Water)
+	s := &FireDeptServer{isBusy: true, currentTruck: "T1", currentTruckX: DeptX, currentTruckY: DeptY, currentTruckWater: 2}
+	s.TickRefill()
+	if s.currentTruckWater != 2+RefillRate {
+		t.Errorf("expected water = %d, got %d", 2+RefillRate, s.currentTruckWater)
 	}
-	if st.Status != BUSY {
-		t.Errorf("expected still BUSY below cap, got %s", st.Status)
+	if !s.isBusy {
+		t.Errorf("expected still busy below cap")
 	}
 }
 
 func TestTickRefill_StopsAndGoesFreeAtCap(t *testing.T) {
-	st := &ServedTruck{X: DeptX, Y: DeptY, Water: TruckWaterCap - 1, Status: BUSY}
-	st.TickRefill()
-	if st.Water != TruckWaterCap {
-		t.Errorf("expected water capped at %d, got %d", TruckWaterCap, st.Water)
+	s := &FireDeptServer{isBusy: true, currentTruck: "T1", currentTruckX: DeptX, currentTruckY: DeptY, currentTruckWater: TruckWaterCap - 1}
+	s.TickRefill()
+	if s.currentTruckWater != TruckWaterCap {
+		t.Errorf("expected water capped at %d, got %d", TruckWaterCap, s.currentTruckWater)
 	}
-	if st.Status != FREE {
-		t.Errorf("expected status FREE at cap, got %s", st.Status)
+	if s.isBusy {
+		t.Errorf("expected isBusy=false at cap")
 	}
-
-	// Further ticks should now no-op since status is FREE.
-	st.TickRefill()
-	if st.Water != TruckWaterCap {
-		t.Errorf("expected water to stay at cap, got %d", st.Water)
+	if s.currentTruck != "" {
+		t.Errorf("expected currentTruck cleared, got %q", s.currentTruck)
+	}
+	s.TickRefill()
+	if s.currentTruckWater != TruckWaterCap {
+		t.Errorf("expected water to stay at cap, got %d", s.currentTruckWater)
 	}
 }
 
 func TestTickRefill_NoChangeWhenNotAtDepot(t *testing.T) {
-	st := &ServedTruck{X: 5, Y: 5, Water: 3, Status: BUSY}
-	st.TickRefill()
-	if st.Water != 3 {
-		t.Errorf("expected water unchanged away from depot, got %d", st.Water)
+	s := &FireDeptServer{isBusy: true, currentTruck: "T1", currentTruckX: 5, currentTruckY: 5, currentTruckWater: 3}
+	s.TickRefill()
+	if s.currentTruckWater != 3 {
+		t.Errorf("expected water unchanged away from depot, got %d", s.currentTruckWater)
 	}
-	if st.Status != BUSY {
-		t.Errorf("expected status unchanged away from depot, got %s", st.Status)
+	if !s.isBusy {
+		t.Errorf("expected isBusy unchanged away from depot")
 	}
 }
