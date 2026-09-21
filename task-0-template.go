@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bufio"
+	"encoding/json"
 	"fmt"
 	"math/rand"
+	"net"
 	"time"
 )
 
@@ -67,6 +70,10 @@ type Truck struct {
 	id    string
 	x, y  int
 	water int
+
+	connection net.Conn
+	refillGranted bool
+	waitTimesteps int
 }
 
 type World struct {
@@ -76,6 +83,36 @@ type World struct {
 }
 
 // ----------------------------- Fire dynamics ------------------------------------
+
+//Function to connect the trucks to localhost:9000
+func (truck *Truck) connect() error {
+	conn, err := net.Dial("tcp", "localhost:9000")
+
+	if err != nil {return err}
+	
+	truck.connection = conn
+	go truck.listen() //start a separate goroutine for listening to messages so that act() can continue to run while the listening
+	return nil
+}
+
+//Function to listen to server messages
+func (truck *Truck) listen() {
+	scanner := bufio.NewScanner(truck.connection)
+
+	for scanner.Scan() {
+		var message Message
+
+		if message.Type == "refill_granted" && message.TruckID == truck.id {
+			truck.refillGranted = true
+		}
+	}
+}
+
+//Function to send REQUEST messages to the server
+func (truck *Truck) sendRequest() {
+	b, _ := json.Marshal(Message{Type: "refill_request", TruckID: truck.id})
+	truck.connection.Write(append(b, '\n'))
+}
 
 func (w *World) addFire(x, y int) {
 	if x == DeptX && y == DeptY {
