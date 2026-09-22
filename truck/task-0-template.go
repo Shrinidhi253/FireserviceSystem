@@ -82,6 +82,15 @@ type World struct {
 	step   int
 }
 
+type Message struct {
+	Type    string `json:"type"`
+	TruckID string `json:"truck_id"`
+	X        int    `json:"x"`
+	Y        int    `json:"y"`
+	Amount   int    `json:"amount"`
+	Capacity int    `json:"capacity"`
+}
+
 // ----------------------------- Fire dynamics ------------------------------------
 
 //Function to connect the trucks to localhost:9000

@@ -7,9 +7,21 @@ import (
 	"sync"
 )
 
+const (
+	DeptX  = 0
+	DeptY  = 0
+	TickMs = 600
+
+	TruckWaterCap = 8 // maximum water units a truck can carry
+)
+
 type Message struct {
 	Type    string `json:"type"`
 	TruckID string `json:"truck_id"`
+	X        int    `json:"x"`
+	Y        int    `json:"y"`
+	Amount   int    `json:"amount"`
+	Capacity int    `json:"capacity"`
 }
 
 type RefillRequest struct {
