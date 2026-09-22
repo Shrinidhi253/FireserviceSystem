@@ -123,11 +123,15 @@ func (truck *Truck) listen() {
 				truck.refillGranted = true
 
 			case "refill_status":
-				if message.Status == "completed" { //if the server announces that the refilling is complete, update the truck's water level accordingly
-					truck.water = TruckWaterCap
-					truck.refillGranted = false
-					truck.refilling = false
-					truck.awaitingGrant = false
+				switch message.Status {
+					case "completed": //if the server announces that the refilling is complete, update the truck's water level accordingly
+						truck.water = TruckWaterCap
+						truck.refillGranted = false
+						truck.refilling = false
+						truck.awaitingGrant = false
+
+					case "in_progress":
+						truck.refilling = true
 				}
 		}
 	}
@@ -216,10 +220,9 @@ func (t *Truck) extinguish(w *World) {
 // act decides what the truck does for one timestep.
 func (t *Truck) act(w *World) {
 	switch {
-	case t.water == 0:
-		// Out of water: head back to the fire department and idle.
-		// Refilling will be implemented in Task 1.
-		t.move(w, toward(t.x, t.y, DeptX, DeptY))
+	case t.water == 0 || t.awaitingGrant || t.refillGranted || t.refilling:
+		//out of water or needs handling the refill protocol
+		t.handleRefillProtocol(w) 
 
 	case w.grid[t.x][t.y].fire:
 		// Standing on a fire: extinguish it.
@@ -232,6 +235,42 @@ func (t *Truck) act(w *World) {
 		} else {
 			t.move(w, randomDir())
 		}
+	}
+}
+
+func (truck *Truck) handleRefillProtocol(world *World) {
+	
+	//Case 1: GRANT has not been requested
+	if (!truck.awaitingGrant) {
+		truck.sendRequest()
+		truck.awaitingGrant = true
+		truck.waitTimesteps = 0
+		return
+	}
+
+	//Case 2: When a REQUEST has been sent, and still waiting for approval
+	if (truck.awaitingGrant && !truck.refillGranted) {
+		truck.waitTimesteps ++
+
+		if truck.waitTimesteps >= 5 { //If the truck has been waiting for GRANT message for more than 5 timesteps, resend the REQUEST
+			truck.sendRequest()
+			truck.waitTimesteps = 0
+		}
+		return
+	}
+
+	//Case 3: The truck has received a GRANT message and needs to move towards to fire department
+	if (truck.refillGranted && !truck.refilling && !(truck.x == DeptX && truck.y == DeptY)) {
+		truck.move(world, toward(truck.x, truck.y, DeptX, DeptY))
+		return
+	}
+
+	//Case 4: The truck has received a GRANT message and it has arrived at the fire department
+	if (truck.refillGranted && !truck.refilling && (truck.x == DeptX && truck.y == DeptY)) {
+		//Notify the server that the truck has arrived at the fire department
+		b, _ := json.Marshal(Message{Type: "arrived_at_dept", TruckID: truck.id})
+		truck.connection.Write(append(b, '\n'))
+		return
 	}
 }
 

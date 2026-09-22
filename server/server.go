@@ -72,6 +72,8 @@ func (s *FireDeptServer) handleConnection(conn net.Conn) {
 		}
 		if msg.Type == "refill_request" {
 			s.enqueueRequest(msg.TruckID, conn)
+		} else if msg.Type == "arrived_at_dept" {
+			s.handleArrivedTruck(msg.TruckID)
 		}
 	}
 }
@@ -103,4 +105,13 @@ func (s *FireDeptServer) sendGrant(req RefillRequest) {
 	reply := Message{Type: "refill_granted", TruckID: req.TruckID}
 	replyBytes, _ := json.Marshal(reply)
 	req.Conn.Write(append(replyBytes, '\n'))
+}
+
+func (server *FireDeptServer) handleArrivedTruck(truckID string) {
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	if server.currentTruck == truckID {//Only care about the position of the truck which has been granted refill
+		server.currentTruckX = DeptX
+		server.currentTruckY = DeptY
+	}
 }
