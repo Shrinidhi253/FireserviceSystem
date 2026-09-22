@@ -19,8 +19,8 @@ func (s *FireDeptServer) TickRefill() {
 	if s.currentTruckWater >= TruckWaterCap {
 		s.currentTruckWater = TruckWaterCap
 		s.isBusy = false
-		s.currentTruck = ""
 		s.sendStatus("completed") //notify the trucks that the refilling is complete when the water reaches TruckWaterCap
+		s.currentTruck = ""
 		s.currentTruckConn = nil //reset the connection of the truck being refilled
 	} else {
 		s.sendStatus("in_progress")

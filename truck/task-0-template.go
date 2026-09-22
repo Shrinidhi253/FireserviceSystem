@@ -40,7 +40,7 @@ clients that send explicit messages to request water refills.
 
 const (
 	GridSize     = 20
-	SimTimesteps = 80
+	SimTimesteps = 100
 	TickMs       = 600
 
 	// Fire dynamics
