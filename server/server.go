@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net"
 	"sync"
+	"time"
 )
 
 const (
@@ -53,6 +54,15 @@ func (s *FireDeptServer) Start() {
 	if err != nil {
 		return
 	}
+
+	go func() { //Call the server refill method
+		ticker := time.NewTicker(TickMs * time.Millisecond)
+		defer ticker.Stop()
+		for range ticker.C {
+			s.TickRefill()
+		}
+	}()
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -114,4 +124,10 @@ func (server *FireDeptServer) handleArrivedTruck(truckID string) {
 		server.currentTruckX = DeptX
 		server.currentTruckY = DeptY
 	}
+}
+
+//Start the server
+func main() {
+	server := NewFireDeptServer()
+	server.Start()
 }

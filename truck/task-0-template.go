@@ -241,7 +241,7 @@ func (t *Truck) act(w *World) {
 func (truck *Truck) handleRefillProtocol(world *World) {
 	
 	//Case 1: GRANT has not been requested
-	if (!truck.awaitingGrant) {
+	if (!truck.awaitingGrant && !truck.refillGranted && !truck.refilling) {
 		truck.sendRequest()
 		truck.awaitingGrant = true
 		truck.waitTimesteps = 0
@@ -268,6 +268,7 @@ func (truck *Truck) handleRefillProtocol(world *World) {
 	//Case 4: The truck has received a GRANT message and it has arrived at the fire department
 	if (truck.refillGranted && !truck.refilling && (truck.x == DeptX && truck.y == DeptY)) {
 		//Notify the server that the truck has arrived at the fire department
+		truck.refilling = true
 		b, _ := json.Marshal(Message{Type: "arrived_at_dept", TruckID: truck.id})
 		truck.connection.Write(append(b, '\n'))
 		return
@@ -406,6 +407,14 @@ func main() {
 			{id: "T2", x: 5, y: 5, water: TruckWaterCap},
 		},
 	}
+
+	//Call connect() method on each truck to connect them with the server
+	for i := range w.trucks {
+	if err := w.trucks[i].connect(); err != nil {
+		fmt.Println("failed to connect truck", w.trucks[i].id, ":", err)
+		return
+	}
+}
 
 	// Seed a few initial fires away from the fire department.
 	w.addFire(0, 11)
