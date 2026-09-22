@@ -22,6 +22,7 @@ type Message struct {
 	Y        int    `json:"y"`
 	Amount   int    `json:"amount"`
 	Capacity int    `json:"capacity"`
+	Status   string `json:"status,omitempty"`
 }
 
 type RefillRequest struct {
@@ -36,6 +37,7 @@ type FireDeptServer struct {
 	currentTruckX     int
 	currentTruckY     int
 	currentTruckWater int
+	currentTruckConn  net.Conn
 	queue             []RefillRequest
 }
 
@@ -92,6 +94,7 @@ func (s *FireDeptServer) enqueueRequest(truckID string, conn net.Conn) {
 		s.queue = s.queue[1:]
 		s.isBusy = true
 		s.currentTruck = req.TruckID
+		s.currentTruckConn = req.Conn //keep track of the connection to which we need to send refill status notifications
 		s.sendGrant(req)
 	}
 }

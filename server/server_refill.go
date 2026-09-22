@@ -1,4 +1,5 @@
 package main
+import "encoding/json"
 
 const RefillRate = 2
 
@@ -19,5 +20,16 @@ func (s *FireDeptServer) TickRefill() {
 		s.currentTruckWater = TruckWaterCap
 		s.isBusy = false
 		s.currentTruck = ""
+		s.sendStatus("completed") //notify the trucks that the refilling is complete when the water reaches TruckWaterCap
+		s.currentTruckConn = nil //reset the connection of the truck being refilled
+	} else {
+		s.sendStatus("in_progress")
 	}
+}
+
+func (server *FireDeptServer) sendStatus(status string) {
+	if server.currentTruckConn == nil {return}
+
+	b, _ := json.Marshal(Message{Type: "refill_status", TruckID: server.currentTruck, Status: status})
+	server.currentTruckConn.Write(append(b, '\n'))
 }

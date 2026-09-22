@@ -73,6 +73,8 @@ type Truck struct {
 
 	connection net.Conn
 	refillGranted bool
+	refilling bool
+	awaitingGrant bool
 	waitTimesteps int
 }
 
@@ -89,6 +91,7 @@ type Message struct {
 	Y        int    `json:"y"`
 	Amount   int    `json:"amount"`
 	Capacity int    `json:"capacity"`
+	Status   string `json:"status,omitempty"`
 }
 
 // ----------------------------- Fire dynamics ------------------------------------
@@ -111,8 +114,21 @@ func (truck *Truck) listen() {
 	for scanner.Scan() {
 		var message Message
 
-		if message.Type == "refill_granted" && message.TruckID == truck.id {
-			truck.refillGranted = true
+		if (json.Unmarshal(scanner.Bytes(), &message) != nil) || message.TruckID != truck.id {
+			continue
+		}
+
+		switch message.Type {
+			case "refill_granted":
+				truck.refillGranted = true
+
+			case "refill_status":
+				if message.Status == "completed" { //if the server announces that the refilling is complete, update the truck's water level accordingly
+					truck.water = TruckWaterCap
+					truck.refillGranted = false
+					truck.refilling = false
+					truck.awaitingGrant = false
+				}
 		}
 	}
 }
