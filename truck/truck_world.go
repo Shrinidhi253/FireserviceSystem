@@ -225,6 +225,9 @@ func (t *Truck) extinguish(w *World) {
 
 // act decides what the truck does for one timestep.
 func (t *Truck) act(w *World) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
 	switch {
 	case t.water == 0 || t.awaitingGrant || t.refillGranted || t.refilling:
 		//out of water or needs handling the refill protocol
