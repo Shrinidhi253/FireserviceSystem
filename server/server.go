@@ -19,7 +19,7 @@ const (
 type Message struct {
 	Type    string `json:"type"`
 	TruckID string `json:"truck_id"`
-	Status   string `json:"status,omitempty"`
+	Status  string `json:"status,omitempty"`
 }
 
 type RefillRequest struct {
@@ -28,14 +28,13 @@ type RefillRequest struct {
 }
 
 type FireDeptServer struct {
-	mu                sync.Mutex
-	isBusy            bool
-	currentTruck      string
-	currentTruckX     int
-	currentTruckY     int
-	currentTruckWater int
-	currentTruckConn  net.Conn
-	queue             []RefillRequest
+	mu                  sync.Mutex
+	isBusy              bool
+	currentTruck        string
+	currentTruckArrived bool
+	currentTruckWater   int
+	currentTruckConn    net.Conn
+	queue               []RefillRequest
 }
 
 func NewFireDeptServer() *FireDeptServer {
@@ -102,7 +101,9 @@ func (s *FireDeptServer) enqueueRequest(truckID string, conn net.Conn) {
 		s.queue = s.queue[1:]
 		s.isBusy = true
 		s.currentTruck = req.TruckID
-		s.currentTruckConn = req.Conn //keep track of the connection to which we need to send refill status notifications
+		s.currentTruckConn = req.Conn
+		s.currentTruckArrived = false
+		s.currentTruckWater = 0
 		s.sendGrant(req)
 	}
 }
@@ -116,13 +117,12 @@ func (s *FireDeptServer) sendGrant(req RefillRequest) {
 func (server *FireDeptServer) handleArrivedTruck(truckID string) {
 	server.mu.Lock()
 	defer server.mu.Unlock()
-	if server.currentTruck == truckID {//Only care about the position of the truck which has been granted refill
-		server.currentTruckX = DeptX
-		server.currentTruckY = DeptY
+	if server.currentTruck == truckID {
+		server.currentTruckArrived = true
 	}
 }
 
-//Start the server
+// Start the server
 func main() {
 	server := NewFireDeptServer()
 	server.Start()

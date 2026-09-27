@@ -3,7 +3,7 @@ package main
 import "testing"
 
 func TestTickRefill_OnlyActsWhenBusy(t *testing.T) {
-	s := &FireDeptServer{isBusy: false, currentTruckX: DeptX, currentTruckY: DeptY, currentTruckWater: 3}
+	s := &FireDeptServer{isBusy: false, currentTruckArrived: true, currentTruckWater: 3}
 	s.TickRefill()
 	if s.currentTruckWater != 3 {
 		t.Errorf("expected water unchanged while not busy, got %d", s.currentTruckWater)
@@ -11,7 +11,7 @@ func TestTickRefill_OnlyActsWhenBusy(t *testing.T) {
 }
 
 func TestTickRefill_IncreasesByZAtDepot(t *testing.T) {
-	s := &FireDeptServer{isBusy: true, currentTruck: "T1", currentTruckX: DeptX, currentTruckY: DeptY, currentTruckWater: 2}
+	s := &FireDeptServer{isBusy: true, currentTruck: "T1", currentTruckArrived: true, currentTruckWater: 2}
 	s.TickRefill()
 	if s.currentTruckWater != 2+RefillRate {
 		t.Errorf("expected water = %d, got %d", 2+RefillRate, s.currentTruckWater)
@@ -22,7 +22,7 @@ func TestTickRefill_IncreasesByZAtDepot(t *testing.T) {
 }
 
 func TestTickRefill_StopsAndGoesFreeAtCap(t *testing.T) {
-	s := &FireDeptServer{isBusy: true, currentTruck: "T1", currentTruckX: DeptX, currentTruckY: DeptY, currentTruckWater: TruckWaterCap - 1}
+	s := &FireDeptServer{isBusy: true, currentTruck: "T1", currentTruckArrived: true, currentTruckWater: TruckWaterCap - 1}
 	s.TickRefill()
 	if s.currentTruckWater != TruckWaterCap {
 		t.Errorf("expected water capped at %d, got %d", TruckWaterCap, s.currentTruckWater)
@@ -39,13 +39,13 @@ func TestTickRefill_StopsAndGoesFreeAtCap(t *testing.T) {
 	}
 }
 
-func TestTickRefill_NoChangeWhenNotAtDepot(t *testing.T) {
-	s := &FireDeptServer{isBusy: true, currentTruck: "T1", currentTruckX: 5, currentTruckY: 5, currentTruckWater: 3}
+func TestTickRefill_NoChangeWhenNotArrived(t *testing.T) {
+	s := &FireDeptServer{isBusy: true, currentTruck: "T1", currentTruckArrived: false, currentTruckWater: 3}
 	s.TickRefill()
 	if s.currentTruckWater != 3 {
-		t.Errorf("expected water unchanged away from depot, got %d", s.currentTruckWater)
+		t.Errorf("expected water unchanged before truck arrives, got %d", s.currentTruckWater)
 	}
 	if !s.isBusy {
-		t.Errorf("expected isBusy unchanged away from depot")
+		t.Errorf("expected isBusy unchanged before truck arrives")
 	}
 }
