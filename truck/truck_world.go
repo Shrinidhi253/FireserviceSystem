@@ -122,13 +122,14 @@ func (truck *Truck) listen() {
 			continue
 		}
 
+		truck.mu.Lock()
 		switch message.Type {
 		case "refill_granted":
 			truck.refillGranted = true
 
 		case "refill_status":
 			switch message.Status {
-			case "completed": //if the server announces that the refilling is complete, update the truck's water level accordingly
+			case "completed":
 				truck.water = TruckWaterCap
 				truck.refillGranted = false
 				truck.refilling = false
@@ -138,6 +139,7 @@ func (truck *Truck) listen() {
 				truck.refilling = true
 			}
 		}
+		truck.mu.Unlock()
 	}
 }
 
