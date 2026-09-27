@@ -303,8 +303,15 @@ func nearestFire(w *World, x, y int) (int, int, bool) {
 }
 
 func occupied(w *World, x, y int, skipID string) bool {
-	for _, t := range w.trucks {
-		if t.id != skipID && t.x == x && t.y == y {
+	for i := range w.trucks {
+		t := &w.trucks[i]
+		if t.id == skipID {
+			continue
+		}
+		t.mu.Lock()
+		match := t.x == x && t.y == y
+		t.mu.Unlock()
+		if match {
 			return true
 		}
 	}
@@ -366,8 +373,12 @@ func display(w *World) {
 			c := w.grid[i][j]
 			isStation := i == DeptX && j == DeptY
 			hasTruck := false
-			for _, t := range w.trucks {
-				if t.x == i && t.y == j {
+			for k := range w.trucks {
+				t := &w.trucks[k]
+				t.mu.Lock()
+				tx, ty := t.x, t.y
+				t.mu.Unlock()
+				if tx == i && ty == j {
 					hasTruck = true
 					break
 				}
@@ -400,8 +411,12 @@ func display(w *World) {
 	}
 
 	fmt.Printf("Step %d", w.step)
-	for _, t := range w.trucks {
-		fmt.Printf("   %s: %d/%d water", t.id, t.water, TruckWaterCap)
+	for i := range w.trucks {
+		t := &w.trucks[i]
+		t.mu.Lock()
+		id, water := t.id, t.water
+		t.mu.Unlock()
+		fmt.Printf("   %s: %d/%d water", id, water, TruckWaterCap)
 	}
 	fmt.Println()
 }
