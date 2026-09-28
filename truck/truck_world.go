@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bufio"
+	"encoding/json"
 	"fmt"
 	"math/rand"
+	"net"
+	"sync"
 	"time"
 )
 
@@ -37,7 +41,7 @@ clients that send explicit messages to request water refills.
 
 const (
 	GridSize     = 20
-	SimTimesteps = 80
+	SimTimesteps = 100
 	TickMs       = 600
 
 	// Fire dynamics
@@ -64,9 +68,16 @@ type Cell struct {
 }
 
 type Truck struct {
+	mu    sync.Mutex
 	id    string
 	x, y  int
 	water int
+
+	connection    net.Conn
+	refillGranted bool
+	refilling     bool
+	awaitingGrant bool
+	waitTimesteps int
 }
 
 type World struct {
@@ -75,7 +86,68 @@ type World struct {
 	step   int
 }
 
+type Message struct {
+	Type     string `json:"type"`
+	TruckID  string `json:"truck_id"`
+	X        int    `json:"x"`
+	Y        int    `json:"y"`
+	Amount   int    `json:"amount"`
+	Capacity int    `json:"capacity"`
+	Status   string `json:"status,omitempty"`
+}
+
 // ----------------------------- Fire dynamics ------------------------------------
+
+// Function to connect the trucks to localhost:9000
+func (truck *Truck) connect() error {
+	conn, err := net.Dial("tcp", "localhost:9000")
+
+	if err != nil {
+		return err
+	}
+
+	truck.connection = conn
+	go truck.listen() //start a separate goroutine for listening to messages so that act() can continue to run while the listening
+	return nil
+}
+
+// Function to listen to server messages
+func (truck *Truck) listen() {
+	scanner := bufio.NewScanner(truck.connection)
+
+	for scanner.Scan() {
+		var message Message
+
+		if (json.Unmarshal(scanner.Bytes(), &message) != nil) || message.TruckID != truck.id {
+			continue
+		}
+
+		truck.mu.Lock()
+		switch message.Type {
+		case "refill_granted":
+			truck.refillGranted = true
+
+		case "refill_status":
+			switch message.Status {
+			case "completed":
+				truck.water = TruckWaterCap
+				truck.refillGranted = false
+				truck.refilling = false
+				truck.awaitingGrant = false
+
+			case "in_progress":
+				truck.refilling = true
+			}
+		}
+		truck.mu.Unlock()
+	}
+}
+
+// Function to send REQUEST messages to the server
+func (truck *Truck) sendRequest() {
+	b, _ := json.Marshal(Message{Type: "refill_request", TruckID: truck.id})
+	truck.connection.Write(append(b, '\n'))
+}
 
 func (w *World) addFire(x, y int) {
 	if x == DeptX && y == DeptY {
@@ -153,11 +225,13 @@ func (t *Truck) extinguish(w *World) {
 
 // act decides what the truck does for one timestep.
 func (t *Truck) act(w *World) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
 	switch {
-	case t.water == 0:
-		// Out of water: head back to the fire department and idle.
-		// Refilling will be implemented in Task 1.
-		t.move(w, toward(t.x, t.y, DeptX, DeptY))
+	case t.water == 0 || t.awaitingGrant || t.refillGranted || t.refilling:
+		//out of water or needs handling the refill protocol
+		t.handleRefillProtocol(w)
 
 	case w.grid[t.x][t.y].fire:
 		// Standing on a fire: extinguish it.
@@ -170,6 +244,43 @@ func (t *Truck) act(w *World) {
 		} else {
 			t.move(w, randomDir())
 		}
+	}
+}
+
+func (truck *Truck) handleRefillProtocol(world *World) {
+
+	//Case 1: GRANT has not been requested
+	if !truck.awaitingGrant && !truck.refillGranted && !truck.refilling {
+		truck.sendRequest()
+		truck.awaitingGrant = true
+		truck.waitTimesteps = 0
+		return
+	}
+
+	//Case 2: When a REQUEST has been sent, and still waiting for approval
+	if truck.awaitingGrant && !truck.refillGranted {
+		truck.waitTimesteps++
+
+		if truck.waitTimesteps >= 5 { //If the truck has been waiting for GRANT message for more than 5 timesteps, resend the REQUEST
+			truck.sendRequest()
+			truck.waitTimesteps = 0
+		}
+		return
+	}
+
+	//Case 3: The truck has received a GRANT message and needs to move towards to fire department
+	if truck.refillGranted && !truck.refilling && !(truck.x == DeptX && truck.y == DeptY) {
+		truck.move(world, toward(truck.x, truck.y, DeptX, DeptY))
+		return
+	}
+
+	//Case 4: The truck has received a GRANT message and it has arrived at the fire department
+	if truck.refillGranted && !truck.refilling && (truck.x == DeptX && truck.y == DeptY) {
+		//Notify the server that the truck has arrived at the fire department
+		truck.refilling = true
+		b, _ := json.Marshal(Message{Type: "arrived_at_dept", TruckID: truck.id})
+		truck.connection.Write(append(b, '\n'))
+		return
 	}
 }
 
@@ -192,8 +303,15 @@ func nearestFire(w *World, x, y int) (int, int, bool) {
 }
 
 func occupied(w *World, x, y int, skipID string) bool {
-	for _, t := range w.trucks {
-		if t.id != skipID && t.x == x && t.y == y {
+	for i := range w.trucks {
+		t := &w.trucks[i]
+		if t.id == skipID {
+			continue
+		}
+		t.mu.Lock()
+		match := t.x == x && t.y == y
+		t.mu.Unlock()
+		if match {
 			return true
 		}
 	}
@@ -255,8 +373,12 @@ func display(w *World) {
 			c := w.grid[i][j]
 			isStation := i == DeptX && j == DeptY
 			hasTruck := false
-			for _, t := range w.trucks {
-				if t.x == i && t.y == j {
+			for k := range w.trucks {
+				t := &w.trucks[k]
+				t.mu.Lock()
+				tx, ty := t.x, t.y
+				t.mu.Unlock()
+				if tx == i && ty == j {
 					hasTruck = true
 					break
 				}
@@ -289,8 +411,12 @@ func display(w *World) {
 	}
 
 	fmt.Printf("Step %d", w.step)
-	for _, t := range w.trucks {
-		fmt.Printf("   %s: %d/%d water", t.id, t.water, TruckWaterCap)
+	for i := range w.trucks {
+		t := &w.trucks[i]
+		t.mu.Lock()
+		id, water := t.id, t.water
+		t.mu.Unlock()
+		fmt.Printf("   %s: %d/%d water", id, water, TruckWaterCap)
 	}
 	fmt.Println()
 }
@@ -298,12 +424,20 @@ func display(w *World) {
 // ----------------------------- Main ---------------------------------------------
 
 func main() {
-	
+
 	w := World{
 		trucks: [NumTrucks]Truck{
 			{id: "T1", x: 0, y: 2, water: TruckWaterCap},
 			{id: "T2", x: 5, y: 5, water: TruckWaterCap},
 		},
+	}
+
+	//Call connect() method on each truck to connect them with the server
+	for i := range w.trucks {
+		if err := w.trucks[i].connect(); err != nil {
+			fmt.Println("failed to connect truck", w.trucks[i].id, ":", err)
+			return
+		}
 	}
 
 	// Seed a few initial fires away from the fire department.

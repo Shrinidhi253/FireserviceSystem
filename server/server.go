@@ -5,11 +5,21 @@ import (
 	"encoding/json"
 	"net"
 	"sync"
+	"time"
+)
+
+const (
+	DeptX  = 0
+	DeptY  = 0
+	TickMs = 600
+
+	TruckWaterCap = 8 // maximum water units a truck can carry
 )
 
 type Message struct {
 	Type    string `json:"type"`
 	TruckID string `json:"truck_id"`
+	Status  string `json:"status,omitempty"`
 }
 
 type RefillRequest struct {
@@ -18,13 +28,13 @@ type RefillRequest struct {
 }
 
 type FireDeptServer struct {
-	mu                sync.Mutex
-	isBusy            bool
-	currentTruck      string
-	currentTruckX     int
-	currentTruckY     int
-	currentTruckWater int
-	queue             []RefillRequest
+	mu                  sync.Mutex
+	isBusy              bool
+	currentTruck        string
+	currentTruckArrived bool
+	currentTruckWater   int
+	currentTruckConn    net.Conn
+	queue               []RefillRequest
 }
 
 func NewFireDeptServer() *FireDeptServer {
@@ -39,6 +49,15 @@ func (s *FireDeptServer) Start() {
 	if err != nil {
 		return
 	}
+
+	go func() { //Call the server refill method
+		ticker := time.NewTicker(TickMs * time.Millisecond)
+		defer ticker.Stop()
+		for range ticker.C {
+			s.TickRefill()
+		}
+	}()
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -58,6 +77,8 @@ func (s *FireDeptServer) handleConnection(conn net.Conn) {
 		}
 		if msg.Type == "refill_request" {
 			s.enqueueRequest(msg.TruckID, conn)
+		} else if msg.Type == "arrived_at_dept" {
+			s.handleArrivedTruck(msg.TruckID)
 		}
 	}
 }
@@ -80,6 +101,9 @@ func (s *FireDeptServer) enqueueRequest(truckID string, conn net.Conn) {
 		s.queue = s.queue[1:]
 		s.isBusy = true
 		s.currentTruck = req.TruckID
+		s.currentTruckConn = req.Conn
+		s.currentTruckArrived = false
+		s.currentTruckWater = 0
 		s.sendGrant(req)
 	}
 }
@@ -88,4 +112,18 @@ func (s *FireDeptServer) sendGrant(req RefillRequest) {
 	reply := Message{Type: "refill_granted", TruckID: req.TruckID}
 	replyBytes, _ := json.Marshal(reply)
 	req.Conn.Write(append(replyBytes, '\n'))
+}
+
+func (server *FireDeptServer) handleArrivedTruck(truckID string) {
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	if server.currentTruck == truckID {
+		server.currentTruckArrived = true
+	}
+}
+
+// Start the server
+func main() {
+	server := NewFireDeptServer()
+	server.Start()
 }
