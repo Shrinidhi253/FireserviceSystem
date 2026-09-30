@@ -359,3 +359,176 @@ func serviceStationRefill(w *World) {
 	}
 }
 
+// ----------------------------- Helper functions ---------------------------------
+
+func nearestFire(w *World, x, y int) (int, int, bool) {
+	best := -1
+	var bx, by int
+	for i := range w.grid {
+		for j := range w.grid[i] {
+			if w.grid[i][j].fire {
+				d := abs(i-x) + abs(j-y)
+				if best < 0 || d < best {
+					best, bx, by = d, i, j
+				}
+			}
+		}
+	}
+	return bx, by, best >= 0
+}
+
+func occupied(w *World, x, y int, skipID string) bool {
+	for _, t := range w.trucks {
+		if t.id != skipID && t.x == x && t.y == y {
+			return true
+		}
+	}
+	return false
+}
+
+func toward(fromX, fromY, toX, toY int) string {
+	dx, dy := toX-fromX, toY-fromY
+	if dx == 0 && dy == 0 {
+		return randomDir()
+	}
+	if abs(dx) > abs(dy) || (abs(dx) == abs(dy) && rand.Intn(2) == 0) {
+		if dx < 0 {
+			return "N"
+		}
+		return "S"
+	}
+	if dy < 0 {
+		return "W"
+	}
+	return "E"
+}
+
+func randomDir() string {
+	return []string{"N", "S", "E", "W"}[rand.Intn(4)]
+}
+
+func inBounds(x, y int) bool {
+	return x >= 0 && x < GridSize && y >= 0 && y < GridSize
+}
+
+func abs(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
+}
+
+// ----------------------------- Display ------------------------------------------
+
+const displayLines = GridSize + 2
+
+func display(w *World) {
+	if w.step > 1 {
+		fmt.Printf("\033[%dA", displayLines)
+	}
+
+	fmt.Print("   ")
+	for j := 0; j < GridSize; j++ {
+		fmt.Printf("%3d", j)
+	}
+	fmt.Println()
+
+	for i := 0; i < GridSize; i++ {
+		fmt.Printf("%2d ", i)
+		for j := 0; j < GridSize; j++ {
+			c := w.grid[i][j]
+			isStation := i == DeptX && j == DeptY
+
+			var truckOnCell *Truck
+			for idx := range w.trucks {
+				if w.trucks[idx].x == i && w.trucks[idx].y == j {
+					truckOnCell = &w.trucks[idx]
+					break
+				}
+			}
+
+			// logic : always display the truck so it never disappears
+			switch {
+			case isStation && truckOnCell != nil:
+				fmt.Print("🚒 ")
+			case isStation:
+				fmt.Print("🏠 ")
+			case truckOnCell != nil && c.fire && truckOnCell.water > 0:
+				fmt.Print("💧 ")
+			case truckOnCell != nil:
+				fmt.Print("🚛 ")
+			case c.fire:
+				switch c.intensity {
+				case 1:
+					fmt.Print("🟨 ")
+				case 2:
+					fmt.Print("🟧 ")
+				case 3:
+					fmt.Print("🟥 ")
+				default:
+					fmt.Print("🔥 ")
+				}
+			default:
+				fmt.Print("🌲 ")
+			}
+		}
+		fmt.Println()
+	}
+
+	fmt.Printf("Step %d", w.step)
+	for _, t := range w.trucks {
+		fmt.Printf("   %s: %d/%d [%s]", t.id, t.water, TruckWaterCap, t.state)
+	}
+	server.mu.Lock()
+	fmt.Printf("   Station: [%s, serving:%s]", server.status, server.currentTruck)
+	server.mu.Unlock()
+	fmt.Println()
+}
+
+// ----------------------------- Main ---------------------------------------------
+
+func main() {
+	go startTCPServer()
+
+	w := World{
+		trucks: [NumTrucks]Truck{
+			{id: "T1", x: 0, y: 2, water: TruckWaterCap, state: StateExtinguishing},
+			{id: "T2", x: 5, y: 5, water: TruckWaterCap, state: StateExtinguishing},
+		},
+	}
+
+	w.addFire(0, 11)
+	w.addFire(11, 7)
+	w.addFire(15, 16)
+
+	for {
+		w.step++
+
+		if w.step%FireIntensifyEvery == 0 {
+			w.intensifyFires()
+		}
+		if w.step%FireSpreadEvery == 0 {
+			w.spreadFires()
+		}
+		if rand.Float32() < NewFireProb {
+			w.addFire(rand.Intn(GridSize), rand.Intn(GridSize))
+		}
+
+		// Request refill over TCP, navigate home, or wait/extinguish
+		for i := range w.trucks {
+			w.trucks[i].act(&w)
+		}
+
+		// Fire department refills the served truck at (0,0) until full
+		serviceStationRefill(&w)
+
+		display(&w)
+
+		if w.step >= SimTimesteps {
+			fmt.Println("Simulation ended.")
+			return
+		}
+
+		time.Sleep(time.Duration(TickMs) * time.Millisecond)
+	}
+}
