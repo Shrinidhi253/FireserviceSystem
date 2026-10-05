@@ -11,6 +11,8 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
+import "dit-357-lab-group-6/types"
+
 // ----------------------------- Configuration ------------------------------------
 
 const (
@@ -35,13 +37,6 @@ const (
 	NumTrucks = 2
 )
 
-// ----------------------------- Protocol Structs ---------------------------------
-
-type Message struct {
-	Type    string `json:"type"`     // "refill_request", "refill_granted"
-	TruckID string `json:"truck_id"` // "T1", "T2"
-}
-
 // ----------------------------- Server State -------------------------------------
 
 type FireDepartmentServer struct {
@@ -57,22 +52,21 @@ var server = &FireDepartmentServer{
 
 //The shared NATS connection
 var natsConnection *nats.Conn
-const refillSubject = "firedept.refill"
 
 //Replaced startTCPServer with NATS subscription
 func startRefillServer() error {
-	_, err := natsConnection.Subscribe(refillSubject, handleRefillRequest)
+	_, err := natsConnection.Subscribe(types.RefillSubject, handleRefillRequest)
 	return err
 }
 
 //Replaced handleTCPRequest 
 func handleRefillRequest(message *nats.Msg) {
-	var request Message
+	var request types.Message
 
 	if err := json.Unmarshal(message.Data, &request); err != nil {
 		return
 	}
-	if request.Type != "refill_request" {
+	if request.Type != types.RefillRequestMessage {
 		return
 	}
 
@@ -83,12 +77,12 @@ func handleRefillRequest(message *nats.Msg) {
 		// Grant refill if the reservoir free + continue giving grant to the truck that already has the refill grant
 		server.status = "BUSY"
 		server.currentTruck = request.TruckID
-		resp := Message{Type: "refill_granted", TruckID: request.TruckID}
+		resp := types.Message{Type: types.RefillGrantedMessage, TruckID: request.TruckID}
 		respBytes, _ := json.Marshal(resp)
 		message.Respond(respBytes)
 		return
 	}
-		// If station is BUSY, do not send back any message.
+		// If station is BUSY, do not send back any types.Message.
 }
 
 
@@ -174,22 +168,22 @@ func (w *World) spreadFires() {
 // Returns true if GRANTED and false if denied, timed out, or nobody is listening (true/false instead of returning the TCP connection)
 
 func tryRequestRefill(truckID string) bool {
-	request := Message{Type: "refill_request", TruckID: truckID}
+	request := types.Message{Type: types.RefillRequestMessage, TruckID: truckID}
 	reqBytes, _ := json.Marshal(request)
 
 	// Deadline if the server does not reply because it is busy (timeout)
-	reply, err := natsConnection.Request(refillSubject, reqBytes, 150*time.Millisecond)
+	reply, err := natsConnection.Request(types.RefillSubject, reqBytes, 150*time.Millisecond)
 	if err != nil {
 		return false
 	}
 
-	var response Message
+	var response types.Message
 	if err := json.Unmarshal(reply.Data, &response); err != nil {
 		return false
 	}
 
 
-	return response.Type == "refill_granted"
+	return response.Type == types.RefillGrantedMessage
 }
 
 // ----------------------------- Truck behaviour ----------------------------------
