@@ -1,14 +1,14 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"math/rand"
 	"net"
-	"strings"
 	"sync"
 	"time"
+
+	"github.com/nats-io/nats.go"
 )
 
 // ----------------------------- Configuration ------------------------------------
@@ -55,57 +55,42 @@ var server = &FireDepartmentServer{
 	status: "FREE",
 }
 
-func startTCPServer() {
-	ln, err := net.Listen("tcp", "localhost:9000")
-	if err != nil {
-		fmt.Printf("Server listen error: %v\n", err)
-		return
-	}
-	defer ln.Close()
+//The shared NATS connection
+var natsConnection *nats.Conn
+const refillSubject = "firedept.refill"
 
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			continue
-		}
-		go handleTCPRequest(conn)
-	}
+//Replaced startTCPServer with NATS subscription
+func startRefillServer() error {
+	_, err := natsConnection.Subscribe(refillSubject, handleRefillRequest)
+	return err
 }
 
-func handleTCPRequest(conn net.Conn) {
-	reader := bufio.NewReader(conn)
-	line, err := reader.ReadString('\n')
-	if err != nil {
-		conn.Close()
+//Replaced handleTCPRequest 
+func handleRefillRequest(message *nats.Msg) {
+	var request Message
+
+	if err := json.Unmarshal(message.Data, &request); err != nil {
 		return
 	}
-
-	var req Message
-	if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &req); err != nil {
-		conn.Close()
+	if request.Type != "refill_request" {
 		return
 	}
 
 	server.mu.Lock()
 	defer server.mu.Unlock()
 
-	if req.Type == "refill_request" {
-		if server.status == "FREE" {
-			// Grant refill and adopt this connection until refill completes
-			server.status = "BUSY"
-			server.currentTruck = req.TruckID
-			server.activeConn = conn
-
-			resp := Message{Type: "refill_granted", TruckID: req.TruckID}
-			respBytes, _ := json.Marshal(resp)
-			conn.Write(append(respBytes, '\n'))
-			return // Keep connection open while refilling; closed when full
-		}
-		// If station is BUSY, do not send back any message.
-		// It simply closes this attempt's connection. Truck will timeout and retry later.
-		conn.Close()
+	if server.status == "FREE" || server.currentTruck == request.TruckID {
+		// Grant refill if the reservoir free + continue giving grant to the truck that already has the refill grant
+		server.status = "BUSY"
+		server.currentTruck = request.TruckID
+		resp := Message{Type: "refill_granted", TruckID: request.TruckID}
+		respBytes, _ := json.Marshal(resp)
+		message.Respond(respBytes)
+		return
 	}
+		// If station is BUSY, do not send back any message.
 }
+
 
 // ----------------------------- Data structures ----------------------------------
 
@@ -129,7 +114,6 @@ type Truck struct {
 	water         int
 	state         TruckState
 	refillGranted bool
-	clientConn    net.Conn // Saved connection to close once full
 }
 
 type World struct {
@@ -182,43 +166,30 @@ func (w *World) spreadFires() {
 	}
 }
 
-// ----------------------------- TCP Client Logic ---------------------------------
 
-// tryRequestRefill opens a connection and sends a refill_request
-// Returns the active connection if GRANTED; returns nil if denied/timed out
-func tryRequestRefill(truckID string) (net.Conn, bool) {
-	conn, err := net.DialTimeout("tcp", "localhost:9000", 150*time.Millisecond)
+//Replaced the previous TCP client logic with NATS client logic
+// ----------------------------- NATS Client Logic ---------------------------------
+
+// tryRequestRefill sends a refill_request and waits for the reply.
+// Returns true if GRANTED and false if denied, timed out, or nobody is listening (true/false instead of returning the TCP connection)
+
+func tryRequestRefill(truckID string) bool {
+	request := Message{Type: "refill_request", TruckID: truckID}
+	reqBytes, _ := json.Marshal(request)
+
+	// Deadline if the server does not reply because it is busy (timeout)
+	reply, err := natsConnection.Request(refillSubject, reqBytes, 150*time.Millisecond)
 	if err != nil {
-		return nil, false
+		return false
 	}
 
-	req := Message{Type: "refill_request", TruckID: truckID}
-	reqBytes, _ := json.Marshal(req)
-	conn.Write(append(reqBytes, '\n'))
-
-	// Read deadline if the server does not reply because it is busy (timeout)
-	conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-	reader := bufio.NewReader(conn)
-	line, err := reader.ReadString('\n')
-	if err != nil {
-		conn.Close()
-		return nil, false
+	var response Message
+	if err := json.Unmarshal(reply.Data, &response); err != nil {
+		return false
 	}
 
-	var resp Message
-	if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &resp); err != nil {
-		conn.Close()
-		return nil, false
-	}
 
-	if resp.Type == "refill_granted" {
-		// Reset deadline back to normal for long-lived refill hold
-		conn.SetReadDeadline(time.Time{})
-		return conn, true
-	}
-
-	conn.Close()
-	return nil, false
+	return response.Type == "refill_granted"
 }
 
 // ----------------------------- Truck behaviour ----------------------------------
@@ -289,9 +260,8 @@ func (t *Truck) act(w *World) {
 
 		// If no grant yet, try to obtain one from the server
 		if !t.refillGranted {
-			if conn, ok := tryRequestRefill(t.id); ok {
+			if tryRequestRefill(t.id) {
 				t.refillGranted = true
-				t.clientConn = conn
 				t.state = StateHeading
 			} else {
 				t.state = StateWaiting
@@ -338,16 +308,6 @@ func serviceStationRefill(w *World) {
 					t.water = TruckWaterCap
 					t.refillGranted = false
 					t.state = StateExtinguishing
-
-					// Close TCP connection on client and server sides
-					if t.clientConn != nil {
-						t.clientConn.Close()
-						t.clientConn = nil
-					}
-					if server.activeConn != nil {
-						server.activeConn.Close()
-						server.activeConn = nil
-					}
 
 					// Reservoir is now available for the waiting truck
 					server.status = "FREE"
@@ -488,7 +448,18 @@ func display(w *World) {
 // ----------------------------- Main ---------------------------------------------
 
 func main() {
-	go startTCPServer()
+	var err error
+	natsConnection, err = nats.Connect(nats.DefaultURL)
+	if err != nil {
+		fmt.Printf("Could not connect to NATS")
+		return
+	}
+	defer natsConnection.Close()
+
+	if err := startRefillServer(); err != nil {
+		fmt.Printf("Could not subscribe")
+		return
+	}
 
 	w := World{
 		trucks: [NumTrucks]Truck{
