@@ -33,6 +33,13 @@ const (
 	DeptY = 0
 
 	NumTrucks = 2
+
+	//Big fire
+	BigFireCellIntensity = MaxIntensity //The current cell must have the highest intensity of fire
+	BigFireNeighbourIntensity = MaxIntensity - 1 //The neighbouring cells must have a fire at least 1 less than the MaxIntensity
+	BigFireNeighbourFiresCount = 3 //At least 3 neighbouring cells must have a fire of BigFireNeighboutIntensity (2)
+	BigFireDetectRadius = 1 //The number of cells from the current cell that is scanned to detect a big fire
+
 )
 
 // ----------------------------- Protocol Structs ---------------------------------
@@ -182,6 +189,27 @@ func (w *World) spreadFires() {
 	}
 }
 
+//isBigFire returns true if a big fire is detected at coordinates (x, y)
+func (w *World) isBigFire(x, y int) bool {
+	if !inBounds(x, y) {
+		return false
+	}
+	
+	c := w.grid[x][y]
+	if !c.fire || c.intensity < MaxIntensity {
+		return false
+	}
+
+	count := 0
+	for _, d := range [4][2]int{{-1, 0}, {1, 0}, {0, -1}, {0, 1}} {
+		nx, ny := x+d[0], y+d[1]
+		if inBounds(nx, ny) && w.grid[nx][ny].fire && w.grid[nx][ny].intensity >= BigFireNeighbourIntensity {
+			count++
+		}
+	}
+	return count >= BigFireNeighbourFiresCount
+}
+
 // ----------------------------- TCP Client Logic ---------------------------------
 
 // tryRequestRefill opens a connection and sends a refill_request
@@ -276,6 +304,26 @@ func (t *Truck) extinguish(w *World) {
 		c.fire = false
 		c.intensity = 0
 	}
+}
+
+//Returns the closest bigFire to the truck
+func (t *Truck) detectBigFire(w *World) (int, int, bool) {
+	bestD := -1
+	var bx, by int
+	for dx := -BigFireDetectRadius; dx <= BigFireDetectRadius; dx++ {
+		for dy := -BigFireDetectRadius; dy <= BigFireDetectRadius; dy++ {
+			d := abs(dx) + abs(dy)
+			if d > BigFireDetectRadius {
+				continue // keeps the shape a diamond, not a square
+			}
+			x, y := t.x+dx, t.y+dy
+			if w.isBigFire(x, y) && (bestD < 0 || d < bestD) {
+				bestD, bx, by = d, x, y
+			}
+		}
+	}
+	return bx, by, bestD >= 0
+
 }
 
 func (t *Truck) act(w *World) {
