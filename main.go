@@ -242,6 +242,13 @@ func subscribeHelp(t *Truck) error {
 	return err
 }
 
+//Method called to publish help request
+func (t *Truck) publishHelp(x, y int) {
+	msg := types.Message{Type: types.HelpRequestMessage, TruckID: t.id, X: x, Y: y}
+	b, _ := json.Marshal(msg)
+	natsConnection.Publish(types.HelpSubject, b)
+}
+
 
 // ----------------------------- Truck behaviour ----------------------------------
 
@@ -323,6 +330,8 @@ func (t *Truck) detectBigFire(w *World) (int, int, bool) {
 func (t *Truck) act(w *World) {
 	// A truck needs water if it is at 0 or still in the process of refilling
 	if t.water == 0 || t.refillGranted {
+		t.isHelping = false //If the water level has reached 0, the trucks cannot offer help
+
 		// If at (0,0) with grant, remain stationary until full
 		if t.x == DeptX && t.y == DeptY && t.refillGranted {
 			t.state = StateRefill
@@ -347,6 +356,22 @@ func (t *Truck) act(w *World) {
 	// Behaviour implemented when water > 0
 	t.state = StateExtinguishing
 	t.refillGranted = false
+
+	// Call for help when a big fire is detected
+	if bx, by, ok := t.detectBigFire(w); ok && w.step-t.lastHelpStep >= HelpCooldown {
+		t.publishHelp(bx, by)
+		t.lastHelpStep = w.step
+	}
+
+	
+	if t.isHelping && !w.grid[t.helpX][t.helpY].fire { //If the fire is out at the location, then no need to help out
+		t.isHelping = false
+	}
+
+	if t.isHelping && (t.x != t.helpX || t.y != t.helpY) {//If the truck has not reached the help location, move towards the help location
+		t.move(w, toward(t.x, t.y, t.helpX, t.helpY))
+		return
+	}
 
 	if w.grid[t.x][t.y].fire {
 		t.extinguish(w)
