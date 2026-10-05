@@ -249,6 +249,25 @@ func (t *Truck) publishHelp(x, y int) {
 	natsConnection.Publish(types.HelpSubject, b)
 }
 
+//Trucks decide whether to help or not
+func (t *Truck) handleHelpRequest() {
+	for {
+		select {
+		case m := <-t.helpInbox:
+			if m.TruckID == t.id || t.isHelping { //if the help is sent by itself or if it is already helping another truck
+				continue 
+			}
+			dist := abs(t.x-m.X) + abs(t.y-m.Y)
+
+			//If the truck has enough water and is not scheduled for refill and the fire is close enough, offer help
+			if t.water >= HelpMinWater && !t.refillGranted && dist <= HelpMaxDistance {
+				t.isHelping, t.helpX, t.helpY = true, m.X, m.Y
+			}
+		default:
+			return
+		}
+	}
+}
 
 // ----------------------------- Truck behaviour ----------------------------------
 
@@ -328,6 +347,8 @@ func (t *Truck) detectBigFire(w *World) (int, int, bool) {
 }
 
 func (t *Truck) act(w *World) {
+	t.handleHelpRequest()
+
 	// A truck needs water if it is at 0 or still in the process of refilling
 	if t.water == 0 || t.refillGranted {
 		t.isHelping = false //If the water level has reached 0, the trucks cannot offer help
