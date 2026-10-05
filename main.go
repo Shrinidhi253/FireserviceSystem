@@ -42,6 +42,12 @@ const (
 	BigFireNeighbourFiresCount = 3 //At least 3 neighbouring cells must have a fire of BigFireNeighboutIntensity (2)
 	BigFireDetectRadius = 1 //The number of cells from the current cell that is scanned to detect a big fire
 
+	//Call for help
+	HelpMinWater    = TruckWaterCap / 2  //Only help if the water level is at least half of the maximum capacity
+	HelpMaxDistance = 10 //Only help if it takes at most 10 up/down/right/left steps to reach the fire
+	HelpCooldown    = 10 //The no. of simulation steps a truck needs to wait before sending another help request
+	HelpInboxCap 	= NumTrucks //Maximum number of messages that the inbox can hold at a time
+
 )
 
 // ----------------------------- Server State -------------------------------------
@@ -115,6 +121,12 @@ type Truck struct {
 	water         int
 	state         TruckState
 	refillGranted bool
+
+	helpInbox    chan types.Message //Truck inbox which stores the help messages
+	isHelping    bool //True if this truck has agreed to help another truck
+	helpX, helpY int //The coordinates where help is needed
+	lastHelpStep int //The last simulation step when this truck sent a help request (used for cooldown calculation)
+
 }
 
 type World struct {
@@ -212,6 +224,24 @@ func tryRequestRefill(truckID string) bool {
 
 	return response.Type == types.RefillGrantedMessage
 }
+
+
+//Trucks subscribe to the HelpSubject and the callback method queues the messages
+func subscribeHelp(t *Truck) error {
+	_, err := natsConnection.Subscribe(types.HelpSubject, func(m *nats.Msg) { //the func() here is the callback function. It only queues the messages.
+		var msg types.Message
+
+		if json.Unmarshal(m.Data, &msg) != nil || msg.Type != types.HelpRequestMessage {
+			return
+		}
+		select {
+			case t.helpInbox <- msg: //If the message can be added to the inbox without having to wait (i.e. inbox not full), then queue the message
+			default: //If the inbox is full and the message has to wait, just skip it/ ignore it.
+		}
+	})
+	return err
+}
+
 
 // ----------------------------- Truck behaviour ----------------------------------
 
@@ -504,9 +534,23 @@ func main() {
 
 	w := World{
 		trucks: [NumTrucks]Truck{
-			{id: "T1", x: 0, y: 2, water: TruckWaterCap, state: StateExtinguishing},
-			{id: "T2", x: 5, y: 5, water: TruckWaterCap, state: StateExtinguishing},
+			{
+				id: "T1", x: 0, y: 2, water: TruckWaterCap, state: StateExtinguishing,
+				helpInbox: make(chan types.Message, HelpInboxCap), lastHelpStep: -HelpCooldown,
+			},
+			{
+				id: "T2", x: 5, y: 5, water: TruckWaterCap, state: StateExtinguishing,
+				helpInbox: make(chan types.Message, HelpInboxCap), lastHelpStep: -HelpCooldown,
+			},
 		},
+	}
+
+	//Subscribe all trucks to the help topic
+	for i := range w.trucks {
+		if err := subscribeHelp(&w.trucks[i]); err != nil {
+			fmt.Printf("Could not subscribe to help subject")
+			return
+		}
 	}
 
 	w.addFire(0, 11)
