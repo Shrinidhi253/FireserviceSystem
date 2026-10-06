@@ -50,7 +50,7 @@ const (
 
 	MaxTrucks                 = 6
 	DeployCooldown            = 10
-	MaxConcurrentHelpRequests = 3
+	MaxConcurrentHelpRequests = 2
 )
 
 // ----------------------------- Server State -------------------------------------
