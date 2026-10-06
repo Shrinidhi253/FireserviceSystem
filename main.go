@@ -42,6 +42,12 @@ const (
 	BigFireNeighbourFiresCount = 3 //At least 3 neighbouring cells must have a fire of BigFireNeighboutIntensity (2)
 	BigFireDetectRadius = 1 //The number of cells from the current cell that is scanned to detect a big fire
 
+	//Call for help
+	HelpMinWater    = TruckWaterCap / 2  //Only help if the water level is at least half of the maximum capacity
+	HelpMaxDistance = 10 //Only help if it takes at most 10 up/down/right/left steps to reach the fire
+	HelpCooldown    = 10 //The no. of simulation steps a truck needs to wait before sending another help request
+	HelpInboxCap 	= NumTrucks //Maximum number of messages that the inbox can hold at a time
+
 )
 
 // ----------------------------- Server State -------------------------------------
@@ -115,6 +121,12 @@ type Truck struct {
 	water         int
 	state         TruckState
 	refillGranted bool
+
+	helpInbox    chan types.Message //Truck inbox which stores the help messages
+	isHelping    bool //True if this truck has agreed to help another truck
+	helpX, helpY int //The coordinates where help is needed
+	lastHelpStep int //The last simulation step when this truck sent a help request (used for cooldown calculation)
+
 }
 
 type World struct {
@@ -213,6 +225,50 @@ func tryRequestRefill(truckID string) bool {
 	return response.Type == types.RefillGrantedMessage
 }
 
+
+//Trucks subscribe to the HelpSubject and the callback method queues the messages
+func subscribeHelp(t *Truck) error {
+	_, err := natsConnection.Subscribe(types.HelpSubject, func(m *nats.Msg) { //the func() here is the callback function. It only queues the messages.
+		var msg types.Message
+
+		if json.Unmarshal(m.Data, &msg) != nil || msg.Type != types.HelpRequestMessage {
+			return
+		}
+		select {
+			case t.helpInbox <- msg: //If the message can be added to the inbox without having to wait (i.e. inbox not full), then queue the message
+			default: //If the inbox is full and the message has to wait, just skip it/ ignore it.
+		}
+	})
+	return err
+}
+
+//Method called to publish help request
+func (t *Truck) publishHelp(x, y int) {
+	msg := types.Message{Type: types.HelpRequestMessage, TruckID: t.id, X: x, Y: y}
+	b, _ := json.Marshal(msg)
+	natsConnection.Publish(types.HelpSubject, b)
+}
+
+//Trucks decide whether to help or not
+func (t *Truck) handleHelpRequest() {
+	for {
+		select {
+		case m := <-t.helpInbox:
+			if m.TruckID == t.id || t.isHelping { //if the help is sent by itself or if it is already helping another truck
+				continue 
+			}
+			dist := abs(t.x-m.X) + abs(t.y-m.Y)
+
+			//If the truck has enough water and is not scheduled for refill and the fire is close enough, offer help
+			if t.water >= HelpMinWater && !t.refillGranted && dist <= HelpMaxDistance {
+				t.isHelping, t.helpX, t.helpY = true, m.X, m.Y
+			}
+		default:
+			return
+		}
+	}
+}
+
 // ----------------------------- Truck behaviour ----------------------------------
 
 func (t *Truck) move(w *World, dir string) {
@@ -291,8 +347,12 @@ func (t *Truck) detectBigFire(w *World) (int, int, bool) {
 }
 
 func (t *Truck) act(w *World) {
+	t.handleHelpRequest()
+
 	// A truck needs water if it is at 0 or still in the process of refilling
 	if t.water == 0 || t.refillGranted {
+		t.isHelping = false //If the water level has reached 0, the trucks cannot offer help
+
 		// If at (0,0) with grant, remain stationary until full
 		if t.x == DeptX && t.y == DeptY && t.refillGranted {
 			t.state = StateRefill
@@ -317,6 +377,22 @@ func (t *Truck) act(w *World) {
 	// Behaviour implemented when water > 0
 	t.state = StateExtinguishing
 	t.refillGranted = false
+
+	// Call for help when a big fire is detected
+	if bx, by, ok := t.detectBigFire(w); ok && w.step-t.lastHelpStep >= HelpCooldown {
+		t.publishHelp(bx, by)
+		t.lastHelpStep = w.step
+	}
+
+	
+	if t.isHelping && !w.grid[t.helpX][t.helpY].fire { //If the fire is out at the location, then no need to help out
+		t.isHelping = false
+	}
+
+	if t.isHelping && (t.x != t.helpX || t.y != t.helpY) {//If the truck has not reached the help location, move towards the help location
+		t.move(w, toward(t.x, t.y, t.helpX, t.helpY))
+		return
+	}
 
 	if w.grid[t.x][t.y].fire {
 		t.extinguish(w)
@@ -504,9 +580,23 @@ func main() {
 
 	w := World{
 		trucks: [NumTrucks]Truck{
-			{id: "T1", x: 0, y: 2, water: TruckWaterCap, state: StateExtinguishing},
-			{id: "T2", x: 5, y: 5, water: TruckWaterCap, state: StateExtinguishing},
+			{
+				id: "T1", x: 0, y: 2, water: TruckWaterCap, state: StateExtinguishing,
+				helpInbox: make(chan types.Message, HelpInboxCap), lastHelpStep: -HelpCooldown,
+			},
+			{
+				id: "T2", x: 5, y: 5, water: TruckWaterCap, state: StateExtinguishing,
+				helpInbox: make(chan types.Message, HelpInboxCap), lastHelpStep: -HelpCooldown,
+			},
 		},
+	}
+
+	//Subscribe all trucks to the help topic
+	for i := range w.trucks {
+		if err := subscribeHelp(&w.trucks[i]); err != nil {
+			fmt.Printf("Could not subscribe to help subject")
+			return
+		}
 	}
 
 	w.addFire(0, 11)
