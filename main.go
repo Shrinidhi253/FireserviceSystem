@@ -48,6 +48,9 @@ const (
 	HelpCooldown    = 10 //The no. of simulation steps a truck needs to wait before sending another help request
 	HelpInboxCap 	= NumTrucks //Maximum number of messages that the inbox can hold at a time
 
+	MaxTrucks                 = 6
+	DeployCooldown            = 10
+	MaxConcurrentHelpRequests = 3
 )
 
 // ----------------------------- Server State -------------------------------------
@@ -65,6 +68,7 @@ var server = &FireDepartmentServer{
 
 //The shared NATS connection
 var natsConnection *nats.Conn
+var worldMutex sync.Mutex
 
 //Replaced startTCPServer with NATS subscription
 func startRefillServer() error {
@@ -131,7 +135,7 @@ type Truck struct {
 
 type World struct {
 	grid   [GridSize][GridSize]Cell
-	trucks [NumTrucks]Truck
+	trucks []Truck
 	step   int
 }
 
@@ -579,7 +583,7 @@ func main() {
 	}
 
 	w := World{
-		trucks: [NumTrucks]Truck{
+		trucks: []Truck{
 			{
 				id: "T1", x: 0, y: 2, water: TruckWaterCap, state: StateExtinguishing,
 				helpInbox: make(chan types.Message, HelpInboxCap), lastHelpStep: -HelpCooldown,
@@ -599,6 +603,25 @@ func main() {
 		}
 	}
 
+	deployRequestChan := make(chan string, 100)
+	_, err = natsConnection.Subscribe(types.HelpSubject, func(m *nats.Msg) {
+		var msg types.Message
+		if json.Unmarshal(m.Data, &msg) != nil || msg.Type != types.HelpRequestMessage {
+			return
+		}
+		select {
+		case deployRequestChan <- msg.TruckID:
+		default:
+		}
+	})
+	if err != nil {
+		fmt.Printf("Could not subscribe to help subject for deployment")
+		return
+	}
+
+	activeHelpRequests := make(map[string]int)
+	lastDeployStep := -DeployCooldown
+
 	w.addFire(0, 11)
 	w.addFire(11, 7)
 	w.addFire(15, 16)
@@ -616,16 +639,45 @@ func main() {
 			w.addFire(rand.Intn(GridSize), rand.Intn(GridSize))
 		}
 
+		for id, step := range activeHelpRequests {
+			if w.step-step > 20 {
+				delete(activeHelpRequests, id)
+			}
+		}
+
+		select {
+		case truckID := <-deployRequestChan:
+			activeHelpRequests[truckID] = w.step
+			if len(activeHelpRequests) >= MaxConcurrentHelpRequests && len(w.trucks) < MaxTrucks && w.step-lastDeployStep >= DeployCooldown {
+				worldMutex.Lock()
+				newID := fmt.Sprintf("T%d", len(w.trucks)+1)
+				newTruck := Truck{
+					id: newID, x: DeptX, y: DeptY, water: TruckWaterCap, state: StateExtinguishing,
+					helpInbox: make(chan types.Message, HelpInboxCap), lastHelpStep: -HelpCooldown,
+				}
+				w.trucks = append(w.trucks, newTruck)
+				go subscribeHelp(&w.trucks[len(w.trucks)-1])
+				lastDeployStep = w.step
+				activeHelpRequests = make(map[string]int)
+				worldMutex.Unlock()
+			}
+		default:
+		}
+
 		// Request refill over TCP, navigate home, or wait/extinguish
+		worldMutex.Lock()
 		for i := range w.trucks {
 			w.trucks[i].act(&w)
 		}
 
 		// Fire department refills the served truck at (0,0) until full
 		serviceStationRefill(&w)
+		worldMutex.Unlock()
 
+		worldMutex.Lock()
 		display(&w)
-
+		worldMutex.Unlock()
+		
 		if w.step >= SimTimesteps {
 			fmt.Println("Simulation ended.")
 			return
