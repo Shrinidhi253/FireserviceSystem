@@ -48,8 +48,11 @@ const (
 	HelpCooldown    = 10 //The no. of simulation steps a truck needs to wait before sending another help request
 	HelpInboxCap 	= NumTrucks //Maximum number of messages that the inbox can hold at a time
 
+	// Maximum number of trucks allowed in the simulation (including initial ones).
 	MaxTrucks                 = 6
+	// Minimum number of simulation steps between two consecutive truck deployments.
 	DeployCooldown            = 10
+	// Number of distinct concurrent help requests required to trigger a new truck deployment.
 	MaxConcurrentHelpRequests = 2
 )
 
@@ -68,6 +71,8 @@ var server = &FireDepartmentServer{
 
 //The shared NATS connection
 var natsConnection *nats.Conn
+// Mutex to protect concurrent access to the World's trucks slice from
+// the NATS callback goroutine and the main simulation loop.
 var worldMutex sync.Mutex
 
 //Replaced startTCPServer with NATS subscription
@@ -135,7 +140,7 @@ type Truck struct {
 
 type World struct {
 	grid   [GridSize][GridSize]Cell
-	trucks []Truck
+	trucks []Truck // Changed from fixed-size array to slice to support dynamic truck additions.
 	step   int
 }
 
@@ -583,7 +588,7 @@ func main() {
 	}
 
 	w := World{
-		trucks: []Truck{
+		trucks: []Truck{ // Slice instead of array, so we can append new trucks at runtime.
 			{
 				id: "T1", x: 0, y: 2, water: TruckWaterCap, state: StateExtinguishing,
 				helpInbox: make(chan types.Message, HelpInboxCap), lastHelpStep: -HelpCooldown,
@@ -603,7 +608,11 @@ func main() {
 		}
 	}
 
+	// Channel used by the NATS callback to notify the main loop of help requests.
 	deployRequestChan := make(chan string, 100)
+
+	// Subscribe to the help subject solely for the purpose of truck deployment.
+	// Every help request is forwarded to deployRequestChan.
 	_, err = natsConnection.Subscribe(types.HelpSubject, func(m *nats.Msg) {
 		var msg types.Message
 		if json.Unmarshal(m.Data, &msg) != nil || msg.Type != types.HelpRequestMessage {
@@ -619,6 +628,8 @@ func main() {
 		return
 	}
 
+	// Tracks which trucks have requested help recently, to avoid double-counting
+	// the same truck and to measure concurrent help requests.
 	activeHelpRequests := make(map[string]int)
 	lastDeployStep := -DeployCooldown
 
@@ -639,32 +650,40 @@ func main() {
 			w.addFire(rand.Intn(GridSize), rand.Intn(GridSize))
 		}
 
+		// Remove help requests that are older than 20 simulation steps.
+		// This keeps the active help request count relevant and up-to-date.
 		for id, step := range activeHelpRequests {
 			if w.step-step > 20 {
 				delete(activeHelpRequests, id)
 			}
 		}
 
+		// Check for new help requests and deploy a new truck if conditions are met:
+		// - At least MaxConcurrentHelpRequests distinct trucks have requested help concurrently.
+		// - Total number of trucks is below MaxTrucks.
+		// - Enough simulation steps have passed since the last deployment (DeployCooldown).
 		select {
 		case truckID := <-deployRequestChan:
 			activeHelpRequests[truckID] = w.step
 			if len(activeHelpRequests) >= MaxConcurrentHelpRequests && len(w.trucks) < MaxTrucks && w.step-lastDeployStep >= DeployCooldown {
 				worldMutex.Lock()
-				newID := fmt.Sprintf("T%d", len(w.trucks)+1)
+				newID := fmt.Sprintf("T%d", len(w.trucks)+1) // Generate T3, T4, T5, ...
 				newTruck := Truck{
 					id: newID, x: DeptX, y: DeptY, water: TruckWaterCap, state: StateExtinguishing,
 					helpInbox: make(chan types.Message, HelpInboxCap), lastHelpStep: -HelpCooldown,
 				}
 				w.trucks = append(w.trucks, newTruck)
-				go subscribeHelp(&w.trucks[len(w.trucks)-1])
+				go subscribeHelp(&w.trucks[len(w.trucks)-1]) // Subscribe the new truck to help messages.
 				lastDeployStep = w.step
-				activeHelpRequests = make(map[string]int)
+				activeHelpRequests = make(map[string]int) // Reset the concurrent help counter.
 				worldMutex.Unlock()
 			}
 		default:
 		}
 
 		// Request refill over TCP, navigate home, or wait/extinguish
+		// Protect the trucks slice while iterating and updating truck states,
+		// because new trucks may be appended by the deployment logic above.
 		worldMutex.Lock()
 		for i := range w.trucks {
 			w.trucks[i].act(&w)
