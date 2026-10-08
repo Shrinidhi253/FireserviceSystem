@@ -611,10 +611,10 @@ func display(w *World) {
 
 	fmt.Printf("Step %d", w.step)
 	for _, t := range w.trucks {
-		fmt.Printf("   %s: %d/%d [%s]", t.id, t.water, TruckWaterCap, t.state)
+		fmt.Printf("  %s: %d/%d [%s]", t.id, t.water, TruckWaterCap, t.state)
 	}
 	server.mu.Lock()
-	fmt.Printf("   Station: [%s, serving:%s]", server.status, server.currentTruck)
+	fmt.Printf("  Station: [%s, serving:%s]", server.status, server.currentTruck)
 	server.mu.Unlock()
 	fmt.Println()
 }
