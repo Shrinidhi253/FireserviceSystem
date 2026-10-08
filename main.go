@@ -288,6 +288,9 @@ func (t *Truck) handleHelpRequest() {
 			//If the truck has enough water and is not scheduled for refill and the fire is close enough, offer help
 			if t.water >= HelpMinWater && !t.refillGranted && dist <= HelpMaxDistance {
 				t.isHelping, t.helpX, t.helpY = true, m.X, m.Y
+
+				t.isIdle = false //If the truck is helping, it cannot be idling at the fire department to save fuel
+				t.idleSteps = 0 //Reset the idle steps counter since the truck is helping
 			}
 		default:
 			return
@@ -378,6 +381,7 @@ func (t *Truck) act(w *World) {
 	// A truck needs water if it is at 0 or still in the process of refilling
 	if t.water == 0 || t.refillGranted {
 		t.isHelping = false //If the water level has reached 0, the trucks cannot offer help
+		t.isIdle = false //If the truck is heading back to refill, it cannot be idling at the fire department to save fuel
 
 		// If at (0,0) with grant, remain stationary until full
 		if t.x == DeptX && t.y == DeptY && t.refillGranted {
@@ -410,23 +414,34 @@ func (t *Truck) act(w *World) {
 		t.lastHelpStep = w.step
 	}
 
-	
+	//Navigation for Assitance
 	if t.isHelping && !w.grid[t.helpX][t.helpY].fire { //If the fire is out at the location, then no need to help out
 		t.isHelping = false
 	}
 
 	if t.isHelping && (t.x != t.helpX || t.y != t.helpY) {//If the truck has not reached the help location, move towards the help location
+		t.idleSteps = 0
+		t.isIdle = false
 		t.move(w, toward(t.x, t.y, t.helpX, t.helpY))
 		return
 	}
 
+	//Extinguising fire on current cell
 	if w.grid[t.x][t.y].fire {
+		t.idleSteps = 0 //Reset idle steps when encountering a fire
+		t.isIdle = false
 		t.extinguish(w)
-	} else if fx, fy, ok := nearestFire(w, t.x, t.y); ok {
-		t.move(w, toward(t.x, t.y, fx, fy))
-	} else {
-		t.move(w, randomDir())
+		return
 	}
+
+	//Move towards nearest fire anywhere on the grid
+	fx, fy, ok := nearestFire(w, t.x, t.y)
+	if ok {
+		t.idleSteps = 0 //Reset idle steps when moving towards a fire
+		t.isIdle = false
+		t.move(w, toward(t.x, t.y, fx, fy))
+		return
+	} 
 }
 
 // ----------------------------- Refill Service -----------------------------------
