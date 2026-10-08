@@ -56,7 +56,7 @@ const (
 	MaxConcurrentHelpRequests = 2
 
 	//Fuel saving parameters
-	IdleThreshold  = 15 // q consecutive timesteps without encountering/fighting a fire before returning to the department
+	IdleThreshold  = 5 // q consecutive timesteps without encountering/fighting a fire before returning to the department
 	MinFieldTrucks = 2  // Minimum number of trucks that must stay active in the field
 )
 
@@ -442,6 +442,22 @@ func (t *Truck) act(w *World) {
 		t.move(w, toward(t.x, t.y, fx, fy))
 		return
 	} 
+
+	t.idleSteps++ //Increment idle steps when no fire is detected and the truck is not moving towards a fire
+
+	//If no fire encountered for q consecutive timestamps
+	if t.idleSteps >= IdleThreshold {
+		if countActiveInField(w) > MinFieldTrucks || t.isIdle { //If there are more than 2 trucks in the field, return to the fire department to save fuel
+			t.isIdle = true
+			t.state = StateIdle //"SAVING_FUEL", stops moving and idles at department
+			return 
+		}
+		t.state = StateHeading
+		t.move(w, toward(t.x, t.y, DeptX, DeptY))
+		return
+	}
+
+	t.move(w, randomDir()) //If fewer than 2 active trucks, cannot return to department; stay in field and roam.
 }
 
 // ----------------------------- Refill Service -----------------------------------
