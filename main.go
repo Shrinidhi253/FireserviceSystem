@@ -57,7 +57,7 @@ const (
 
 	//Fuel saving parameters
 	IdleThreshold  = 5 // q consecutive timesteps without encountering/fighting a fire before returning to the department
-	MinFieldTrucks = 2  // Minimum number of trucks that must stay active in the field
+	MinFieldTrucks = 2  // Minimum number of trucks that must stay active in the field (can be changed to 1 for testing purposes)
 )
 
 // ----------------------------- Server State -------------------------------------
@@ -447,17 +447,34 @@ func (t *Truck) act(w *World) {
 
 	//If no fire encountered for q consecutive timestamps
 	if t.idleSteps >= IdleThreshold {
-		if countActiveInField(w) > MinFieldTrucks || t.isIdle { //If there are more than 2 trucks in the field, return to the fire department to save fuel
-			t.isIdle = true
-			t.state = StateIdle //"SAVING_FUEL", stops moving and idles at department
-			return 
+		
+		// If already idling at the station, stays there until a new fire is detected
+		if t.isIdle && t.x == DeptX && t.y == DeptY {
+			t.state = StateIdle
+			return
 		}
-		t.state = StateHeading
-		t.move(w, toward(t.x, t.y, DeptX, DeptY))
-		return
+
+		// Check if returning would leave at least MinFieldTrucks active
+		if countActiveInField(w) > MinFieldTrucks {
+			// Check if we just reached the station (0,0)
+			if t.x == DeptX && t.y == DeptY {
+				t.isIdle = true
+				t.state = StateIdle // Only becomes SAVING_FUEL at (0,0)
+				return
+			}
+
+			// Still on route to station
+			t.isIdle = false
+			t.state = StateHeading // MUST be HEADING_BACK while moving
+			t.move(w, toward(t.x, t.y, DeptX, DeptY))
+			return
+		}
 	}
 
-	t.move(w, randomDir()) //If fewer than 2 active trucks, cannot return to department; stay in field and roam.
+	// Must stay in field (either not idle long enough, or active count would drop below minimum)
+	t.isIdle = false
+	t.state = StateExtinguishing
+	t.move(w, randomDir())
 }
 
 // ----------------------------- Refill Service -----------------------------------
