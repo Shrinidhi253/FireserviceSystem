@@ -54,6 +54,10 @@ const (
 	DeployCooldown            = 10
 	// Number of distinct concurrent help requests required to trigger a new truck deployment.
 	MaxConcurrentHelpRequests = 2
+
+	//Fuel saving parameters
+	IdleThreshold  = 5 // q consecutive timesteps without encountering/fighting a fire before returning to the department
+	MinFieldTrucks = 2  // Minimum number of trucks that must stay active in the field (can be changed to 1 for testing purposes)
 )
 
 // ----------------------------- Server State -------------------------------------
@@ -122,6 +126,7 @@ const (
 	StateWaiting  TruckState = "WAITING_GRANT"
 	StateHeading  TruckState = "HEADING_BACK"
 	StateRefill   TruckState = "REFILLING"
+	StateIdle     TruckState = "SAVING_FUEL" // Idling at the fire department to save fuel
 )
 
 type Truck struct {
@@ -135,13 +140,25 @@ type Truck struct {
 	isHelping    bool //True if this truck has agreed to help another truck
 	helpX, helpY int //The coordinates where help is needed
 	lastHelpStep int //The last simulation step when this truck sent a help request (used for cooldown calculation)
-
+	idleSteps    int // Number of consecutive timesteps without encountering/fighting a fire
+	isIdle 	 bool // True if the truck returned to the fire department to save fuel
 }
 
 type World struct {
 	grid   [GridSize][GridSize]Cell
 	trucks []Truck // Changed from fixed-size array to slice to support dynamic truck additions.
 	step   int
+}
+
+// countActiveInField counts trucks that are not idling at (0,0) saving fuel
+func countActiveInField(w *World) int {
+	active := 0
+	for _, t := range w.trucks {
+		if !t.isIdle {
+			active++
+		}
+	}
+	return active
 }
 
 // ----------------------------- Fire dynamics ------------------------------------
@@ -271,6 +288,9 @@ func (t *Truck) handleHelpRequest() {
 			//If the truck has enough water and is not scheduled for refill and the fire is close enough, offer help
 			if t.water >= HelpMinWater && !t.refillGranted && dist <= HelpMaxDistance {
 				t.isHelping, t.helpX, t.helpY = true, m.X, m.Y
+
+				t.isIdle = false //If the truck is helping, it cannot be idling at the fire department to save fuel
+				t.idleSteps = 0 //Reset the idle steps counter since the truck is helping
 			}
 		default:
 			return
@@ -361,6 +381,7 @@ func (t *Truck) act(w *World) {
 	// A truck needs water if it is at 0 or still in the process of refilling
 	if t.water == 0 || t.refillGranted {
 		t.isHelping = false //If the water level has reached 0, the trucks cannot offer help
+		t.isIdle = false //If the truck is heading back to refill, it cannot be idling at the fire department to save fuel
 
 		// If at (0,0) with grant, remain stationary until full
 		if t.x == DeptX && t.y == DeptY && t.refillGranted {
@@ -393,23 +414,67 @@ func (t *Truck) act(w *World) {
 		t.lastHelpStep = w.step
 	}
 
-	
+	//Navigation for Assitance
 	if t.isHelping && !w.grid[t.helpX][t.helpY].fire { //If the fire is out at the location, then no need to help out
 		t.isHelping = false
 	}
 
 	if t.isHelping && (t.x != t.helpX || t.y != t.helpY) {//If the truck has not reached the help location, move towards the help location
+		t.idleSteps = 0
+		t.isIdle = false
 		t.move(w, toward(t.x, t.y, t.helpX, t.helpY))
 		return
 	}
 
+	//Extinguising fire on current cell
 	if w.grid[t.x][t.y].fire {
+		t.idleSteps = 0 //Reset idle steps when encountering a fire
+		t.isIdle = false
 		t.extinguish(w)
-	} else if fx, fy, ok := nearestFire(w, t.x, t.y); ok {
-		t.move(w, toward(t.x, t.y, fx, fy))
-	} else {
-		t.move(w, randomDir())
+		return
 	}
+
+	//Move towards nearest fire anywhere on the grid
+	fx, fy, ok := nearestFire(w, t.x, t.y)
+	if ok {
+		t.idleSteps = 0 //Reset idle steps when moving towards a fire
+		t.isIdle = false
+		t.move(w, toward(t.x, t.y, fx, fy))
+		return
+	} 
+
+	t.idleSteps++ //Increment idle steps when no fire is detected and the truck is not moving towards a fire
+
+	//If no fire encountered for q consecutive timestamps
+	if t.idleSteps >= IdleThreshold {
+		
+		// If already idling at the station, stays there until a new fire is detected
+		if t.isIdle && t.x == DeptX && t.y == DeptY {
+			t.state = StateIdle
+			return
+		}
+
+		// Check if returning would leave at least MinFieldTrucks active
+		if countActiveInField(w) > MinFieldTrucks {
+			// Check if we just reached the station (0,0)
+			if t.x == DeptX && t.y == DeptY {
+				t.isIdle = true
+				t.state = StateIdle // Only becomes SAVING_FUEL at (0,0)
+				return
+			}
+
+			// Still on route to station
+			t.isIdle = false
+			t.state = StateHeading // MUST be HEADING_BACK while moving
+			t.move(w, toward(t.x, t.y, DeptX, DeptY))
+			return
+		}
+	}
+
+	// Must stay in field (either not idle long enough, or active count would drop below minimum)
+	t.isIdle = false
+	t.state = StateExtinguishing
+	t.move(w, randomDir())
 }
 
 // ----------------------------- Refill Service -----------------------------------
@@ -563,10 +628,10 @@ func display(w *World) {
 
 	fmt.Printf("Step %d", w.step)
 	for _, t := range w.trucks {
-		fmt.Printf("   %s: %d/%d [%s]", t.id, t.water, TruckWaterCap, t.state)
+		fmt.Printf("  %s: %d/%d [%s]", t.id, t.water, TruckWaterCap, t.state)
 	}
 	server.mu.Lock()
-	fmt.Printf("   Station: [%s, serving:%s]", server.status, server.currentTruck)
+	fmt.Printf("  Station: [%s, serving:%s]", server.status, server.currentTruck)
 	server.mu.Unlock()
 	fmt.Println()
 }
