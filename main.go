@@ -54,6 +54,10 @@ const (
 	DeployCooldown            = 10
 	// Number of distinct concurrent help requests required to trigger a new truck deployment.
 	MaxConcurrentHelpRequests = 2
+
+	//Fuel saving parameters
+	IdleThreshold  = 15 // q consecutive timesteps without encountering/fighting a fire before returning to the department
+	MinFieldTrucks = 2  // Minimum number of trucks that must stay active in the field
 )
 
 // ----------------------------- Server State -------------------------------------
@@ -122,6 +126,7 @@ const (
 	StateWaiting  TruckState = "WAITING_GRANT"
 	StateHeading  TruckState = "HEADING_BACK"
 	StateRefill   TruckState = "REFILLING"
+	StateIdle     TruckState = "SAVING_FUEL" // Idling at the fire department to save fuel
 )
 
 type Truck struct {
@@ -135,13 +140,25 @@ type Truck struct {
 	isHelping    bool //True if this truck has agreed to help another truck
 	helpX, helpY int //The coordinates where help is needed
 	lastHelpStep int //The last simulation step when this truck sent a help request (used for cooldown calculation)
-
+	idleSteps    int // Number of consecutive timesteps without encountering/fighting a fire
+	isIdle 	 bool // True if the truck returned to the fire department to save fuel
 }
 
 type World struct {
 	grid   [GridSize][GridSize]Cell
 	trucks []Truck // Changed from fixed-size array to slice to support dynamic truck additions.
 	step   int
+}
+
+// countActiveInField counts trucks that are not idling at (0,0) saving fuel
+func countActiveInField(w *World) int {
+	active := 0
+	for _, t := range w.trucks {
+		if !t.isIdle {
+			active++
+		}
+	}
+	return active
 }
 
 // ----------------------------- Fire dynamics ------------------------------------
