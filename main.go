@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -192,6 +193,33 @@ func grantNext() {
 	natsConnection.Publish(next.Reply, respBytes)
 }
 
+// ----------------------------- Logging ------------------------------------------
+
+var (
+	logMu    sync.Mutex
+	logFiles = map[string]*os.File{}
+)
+
+// logEvent appends one line to the truck's own log file (logs/<truckID>.log).
+// The zero-padded Lamport value at the start of each line means that
+// `cat logs/*.log | sort` gives one combined log in a globally consistent
+// order (Lamport value first, truck ID as tie-break).
+func logEvent(truckID string, lamport int, action, detail string) {
+	logMu.Lock()
+	defer logMu.Unlock()
+
+	f, ok := logFiles[truckID]
+	if !ok {
+		var err error
+		f, err = os.OpenFile("logs/"+truckID+".log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return
+		}
+		logFiles[truckID] = f
+	}
+	fmt.Fprintf(f, "L=%06d %-3s %-15s %s\n", lamport, truckID, action, detail)
+}
+
 // ----------------------------- Data structures ----------------------------------
 
 type Cell struct {
@@ -355,6 +383,7 @@ func (t *Truck) sendRefillRequest() {
 	}
 	reqBytes, _ := json.Marshal(request)
 	natsConnection.PublishRequest(types.RefillSubject, grantSubject(t.id), reqBytes)
+	logEvent(t.id, t.lamportClock, "refill_request", "")
 }
 
 // Trucks subscribe to the HelpSubject and the callback method queues the messages
@@ -416,6 +445,16 @@ func (t *Truck) handleHelpRequest() {
 // ----------------------------- Truck behaviour ----------------------------------
 
 func (t *Truck) move(w *World, dir string) {
+	// Moving is a local event: if the truck actually changed cell, tick the
+	// Lamport clock and log it.
+	ox, oy := t.x, t.y
+	defer func() {
+		if t.x != ox || t.y != oy {
+			t.lamportClock++
+			logEvent(t.id, t.lamportClock, "move", fmt.Sprintf("(%d,%d)->(%d,%d)", ox, oy, t.x, t.y))
+		}
+	}()
+
 	nx, ny := t.x, t.y
 	switch dir {
 	case "N":
@@ -468,6 +507,9 @@ func (t *Truck) extinguish(w *World) {
 		c.fire = false
 		c.intensity = 0
 	}
+	// Extinguishing is a local event: tick the Lamport clock and log it.
+	t.lamportClock++
+	logEvent(t.id, t.lamportClock, "extinguish", fmt.Sprintf("(%d,%d) intensity=%d", t.x, t.y, c.intensity))
 }
 
 // Returns the closest bigFire to the truck
@@ -519,6 +561,7 @@ func (t *Truck) act(w *World) {
 				t.lamportClock = max(t.lamportClock, g.LamportTime) + 1
 				t.refillGranted = true
 				t.state = StateHeading
+				logEvent(t.id, t.lamportClock, "refill_granted", "")
 			default:
 				t.state = StateWaiting
 			}
@@ -785,6 +828,13 @@ func main() {
 		return
 	}
 	defer natsConnection.Close()
+
+	// Fresh per-truck log files for every run.
+	os.RemoveAll("logs")
+	if err := os.MkdirAll("logs", 0o755); err != nil {
+		fmt.Printf("Could not create logs directory")
+		return
+	}
 
 	if err := startRefillServer(); err != nil {
 		fmt.Printf("Could not subscribe")
