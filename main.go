@@ -67,6 +67,7 @@ type FireDepartmentServer struct {
 	status       string   // "FREE" or "BUSY"
 	currentTruck string   // Truck ID currently holding the reservoir
 	activeConn   net.Conn // Open connection with the truck currently refilling
+	lamportClock int      // Lamport logical clock for fire department
 }
 
 var server = &FireDepartmentServer{
@@ -99,11 +100,21 @@ func handleRefillRequest(message *nats.Msg) {
 	server.mu.Lock()
 	defer server.mu.Unlock()
 
+	//here we update local clock based on the timestamps of incoming messages
+	server.lamportClock = max(server.lamportClock, request.LamportTime) + 1
+
 	if server.status == "FREE" || server.currentTruck == request.TruckID {
-		// Grant refill if the reservoir free + continue giving grant to the truck that already has the refill grant
+		
+		// Lamport send rule: increment local clock before sending a message.
+		server.lamportClock++
+
 		server.status = "BUSY"
 		server.currentTruck = request.TruckID
-		resp := types.Message{Type: types.RefillGrantedMessage, TruckID: request.TruckID}
+		resp := types.Message{
+			Type:        types.RefillGrantedMessage,
+			TruckID:     request.TruckID,
+			LamportTime: server.lamportClock,
+		}
 		respBytes, _ := json.Marshal(resp)
 		message.Respond(respBytes)
 		return
@@ -139,9 +150,13 @@ type Truck struct {
 	helpInbox    chan types.Message //Truck inbox which stores the help messages
 	isHelping    bool //True if this truck has agreed to help another truck
 	helpX, helpY int //The coordinates where help is needed
-	lastHelpStep int //The last simulation step when this truck sent a help request (used for cooldown calculation)
-	idleSteps    int // Number of consecutive timesteps without encountering/fighting a fire
-	isIdle 	 bool // True if the truck returned to the fire department to save fuel
+	
+	lastHelpStep int // The last simulation step when this truck sent a help request (used for cooldown calculation).
+
+	lamportClock int // Lamport logical clock for this truck.
+
+	idleSteps    int  // Number of consecutive timesteps without encountering/fighting a fire.
+	isIdle       bool // True if the truck returned to the fire department to save fuel.
 }
 
 type World struct {
@@ -232,8 +247,14 @@ func (w *World) isBigFire(x, y int) bool {
 // tryRequestRefill sends a refill_request and waits for the reply.
 // Returns true if GRANTED and false if denied, timed out, or nobody is listening (true/false instead of returning the TCP connection)
 
-func tryRequestRefill(truckID string) bool {
-	request := types.Message{Type: types.RefillRequestMessage, TruckID: truckID}
+func tryRequestRefill(t *Truck) bool {
+	//when sending, increment local clock before sending a message.
+	t.lamportClock++
+	request := types.Message{
+		Type:        types.RefillRequestMessage,
+		TruckID:     t.id,
+		LamportTime: t.lamportClock,
+	}
 	reqBytes, _ := json.Marshal(request)
 
 	// Deadline if the server does not reply because it is busy (timeout)
@@ -247,6 +268,8 @@ func tryRequestRefill(truckID string) bool {
 		return false
 	}
 
+	//Again we update local clock based on incoming message timestamp when receiving
+    t.lamportClock = max(t.lamportClock, response.LamportTime) + 1
 
 	return response.Type == types.RefillGrantedMessage
 }
@@ -260,6 +283,8 @@ func subscribeHelp(t *Truck) error {
 		if json.Unmarshal(m.Data, &msg) != nil || msg.Type != types.HelpRequestMessage {
 			return
 		}
+
+		t.lamportClock = max(t.lamportClock, msg.LamportTime) + 1 //This is adding a timestamp
 		select {
 			case t.helpInbox <- msg: //If the message can be added to the inbox without having to wait (i.e. inbox not full), then queue the message
 			default: //If the inbox is full and the message has to wait, just skip it/ ignore it.
@@ -268,9 +293,17 @@ func subscribeHelp(t *Truck) error {
 	return err
 }
 
-//Method called to publish help request
+//Method called to publish help request with lamport clock
 func (t *Truck) publishHelp(x, y int) {
-	msg := types.Message{Type: types.HelpRequestMessage, TruckID: t.id, X: x, Y: y}
+	//also increment clock before sending a message
+	t.lamportClock++
+	msg := types.Message{
+		Type:        types.HelpRequestMessage,
+		TruckID:     t.id,
+		X:           x,
+		Y:           y,
+		LamportTime: t.lamportClock,
+	}
 	b, _ := json.Marshal(msg)
 	natsConnection.Publish(types.HelpSubject, b)
 }
@@ -391,7 +424,8 @@ func (t *Truck) act(w *World) {
 
 		// If no grant yet, try to obtain one from the server
 		if !t.refillGranted {
-			if tryRequestRefill(t.id) {
+			if tryRequestRefill(t) { //I changed "t.id" to "t" because when requesting refill,
+									//we used to take ID string as parameter, and now it is "t*Truck"
 				t.refillGranted = true
 				t.state = StateHeading
 			} else {
@@ -705,6 +739,16 @@ func main() {
 	for {
 		w.step++
 
+		//increment on every local event as lamport clock, one per step
+
+		server.mu.Lock()
+		server.lamportClock++
+		server.mu.Unlock()
+		for i := range w.trucks {
+			w.trucks[i].lamportClock++
+		}
+
+
 		if w.step%FireIntensifyEvery == 0 {
 			w.intensifyFires()
 		}
@@ -769,4 +813,13 @@ func main() {
 
 		time.Sleep(time.Duration(TickMs) * time.Millisecond)
 	}
+}
+
+//in case our version of go doesn't have a package for max func
+//this func returns the larger int among 2
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
