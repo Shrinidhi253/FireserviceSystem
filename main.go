@@ -1,17 +1,19 @@
 package main
 
 import (
+	"container/heap"
 	"encoding/json"
 	"fmt"
 	"math/rand"
-	"net"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
+	"dit-357-lab-group-6/types"
+
 	"github.com/nats-io/nats.go"
 )
-
-import "dit-357-lab-group-6/types"
 
 // ----------------------------- Configuration ------------------------------------
 
@@ -37,56 +39,101 @@ const (
 	NumTrucks = 2
 
 	//Big fire
-	BigFireCellIntensity = MaxIntensity //The current cell must have the highest intensity of fire
-	BigFireNeighbourIntensity = MaxIntensity - 1 //The neighbouring cells must have a fire at least 1 less than the MaxIntensity
-	BigFireNeighbourFiresCount = 3 //At least 3 neighbouring cells must have a fire of BigFireNeighboutIntensity (2)
-	BigFireDetectRadius = 1 //The number of cells from the current cell that is scanned to detect a big fire
+	BigFireCellIntensity       = MaxIntensity     //The current cell must have the highest intensity of fire
+	BigFireNeighbourIntensity  = MaxIntensity - 1 //The neighbouring cells must have a fire at least 1 less than the MaxIntensity
+	BigFireNeighbourFiresCount = 3                //At least 3 neighbouring cells must have a fire of BigFireNeighboutIntensity (2)
+	BigFireDetectRadius        = 1                //The number of cells from the current cell that is scanned to detect a big fire
 
 	//Call for help
-	HelpMinWater    = TruckWaterCap / 2  //Only help if the water level is at least half of the maximum capacity
-	HelpMaxDistance = 10 //Only help if it takes at most 10 up/down/right/left steps to reach the fire
-	HelpCooldown    = 10 //The no. of simulation steps a truck needs to wait before sending another help request
-	HelpInboxCap 	= NumTrucks //Maximum number of messages that the inbox can hold at a time
+	HelpMinWater    = TruckWaterCap / 2 //Only help if the water level is at least half of the maximum capacity
+	HelpMaxDistance = 10                //Only help if it takes at most 10 up/down/right/left steps to reach the fire
+	HelpCooldown    = 10                //The no. of simulation steps a truck needs to wait before sending another help request
+	HelpInboxCap    = NumTrucks         //Maximum number of messages that the inbox can hold at a time
 
 	// Maximum number of trucks allowed in the simulation (including initial ones).
-	MaxTrucks                 = 6
+	MaxTrucks = 6
 	// Minimum number of simulation steps between two consecutive truck deployments.
-	DeployCooldown            = 10
+	DeployCooldown = 10
 	// Number of distinct concurrent help requests required to trigger a new truck deployment.
 	MaxConcurrentHelpRequests = 2
 
 	//Fuel saving parameters
 	IdleThreshold  = 5 // q consecutive timesteps without encountering/fighting a fire before returning to the department
-	MinFieldTrucks = 2  // Minimum number of trucks that must stay active in the field (can be changed to 1 for testing purposes)
+	MinFieldTrucks = 2 // Minimum number of trucks that must stay active in the field (can be changed to 1 for testing purposes)
 )
 
 // ----------------------------- Server State -------------------------------------
 
+// refillEntry is one pending refill request waiting in the fire department's queue.
+type refillEntry struct {
+	TruckID string
+	Lamport int    // Lamport timestamp the truck attached to its request
+	Reply   string // NATS reply subject the grant must be published to
+}
+
+// refillQueue implements heap.Interface: a priority queue ordered by
+// (Lamport timestamp, truck ID). The truck ID breaks ties between requests
+// with equal timestamps, so the order is total and deterministic.
+type refillQueue []refillEntry
+
+func (q refillQueue) Len() int { return len(q) }
+func (q refillQueue) Less(i, j int) bool {
+	if q[i].Lamport != q[j].Lamport {
+		return q[i].Lamport < q[j].Lamport
+	}
+	return q[i].TruckID < q[j].TruckID
+}
+func (q refillQueue) Swap(i, j int) { q[i], q[j] = q[j], q[i] }
+func (q *refillQueue) Push(x any)   { *q = append(*q, x.(refillEntry)) }
+func (q *refillQueue) Pop() any {
+	old := *q
+	n := len(old)
+	x := old[n-1]
+	*q = old[:n-1]
+	return x
+}
+
+// snapshot returns the queue contents in grant order (a heap's internal slice
+// order is not sorted), formatted for the display and the debug trace.
+func (q refillQueue) snapshot() string {
+	sorted := make(refillQueue, len(q))
+	copy(sorted, q)
+	sort.Slice(sorted, func(i, j int) bool { return sorted.Less(i, j) })
+	parts := make([]string, len(sorted))
+	for i, e := range sorted {
+		parts[i] = fmt.Sprintf("%s(L=%d)", e.TruckID, e.Lamport)
+	}
+	return strings.Join(parts, " ")
+}
+
 type FireDepartmentServer struct {
 	mu           sync.Mutex
-	status       string   // "FREE" or "BUSY"
-	currentTruck string   // Truck ID currently holding the reservoir
-	activeConn   net.Conn // Open connection with the truck currently refilling
-	lamportClock int      // Lamport logical clock for fire department
+	status       string      // "FREE" or "BUSY"
+	currentTruck string      // Truck ID currently holding the reservoir
+	lamportClock int         // Lamport logical clock for fire department
+	queue        refillQueue // Pending refill requests, ordered by (timestamp, truck_id)
 }
 
 var server = &FireDepartmentServer{
 	status: "FREE",
 }
 
-//The shared NATS connection
+// The shared NATS connection
 var natsConnection *nats.Conn
+
 // Mutex to protect concurrent access to the World's trucks slice from
 // the NATS callback goroutine and the main simulation loop.
 var worldMutex sync.Mutex
 
-//Replaced startTCPServer with NATS subscription
 func startRefillServer() error {
 	_, err := natsConnection.Subscribe(types.RefillSubject, handleRefillRequest)
 	return err
 }
 
-//Replaced handleTCPRequest 
+// handleRefillRequest only ENQUEUES the request. It never grants directly:
+// granting is done once per timestep by grantNext(), so that all requests that
+// arrived during a tick are compared by (timestamp, truck_id) rather than by
+// whichever message the OS/NATS happened to deliver first.
 func handleRefillRequest(message *nats.Msg) {
 	var request types.Message
 
@@ -100,28 +147,50 @@ func handleRefillRequest(message *nats.Msg) {
 	server.mu.Lock()
 	defer server.mu.Unlock()
 
-	//here we update local clock based on the timestamps of incoming messages
+	// Lamport receive rule: C = max(C, C_msg) + 1
 	server.lamportClock = max(server.lamportClock, request.LamportTime) + 1
 
-	if server.status == "FREE" || server.currentTruck == request.TruckID {
-		
-		// Lamport send rule: increment local clock before sending a message.
-		server.lamportClock++
-
-		server.status = "BUSY"
-		server.currentTruck = request.TruckID
-		resp := types.Message{
-			Type:        types.RefillGrantedMessage,
-			TruckID:     request.TruckID,
-			LamportTime: server.lamportClock,
-		}
-		respBytes, _ := json.Marshal(resp)
-		message.Respond(respBytes)
+	// Ignore requests from the truck that is currently being served.
+	if server.currentTruck == request.TruckID {
 		return
 	}
-		// If station is BUSY, do not send back any types.Message.
+	// Ignore duplicates: the truck is already waiting in the queue.
+	for _, e := range server.queue {
+		if e.TruckID == request.TruckID {
+			return
+		}
+	}
+
+	heap.Push(&server.queue, refillEntry{
+		TruckID: request.TruckID,
+		Lamport: request.LamportTime,
+		Reply:   message.Reply,
+	})
 }
 
+// grantNext grants the reservoir to the head of the queue if the reservoir is FREE.
+// The caller must hold server.mu.
+func grantNext() {
+	if server.status != "FREE" || server.queue.Len() == 0 {
+		return
+	}
+
+	next := heap.Pop(&server.queue).(refillEntry)
+
+	// Lamport send rule: increment local clock before sending a message.
+	server.lamportClock++
+
+	server.status = "BUSY"
+	server.currentTruck = next.TruckID
+
+	resp := types.Message{
+		Type:        types.RefillGrantedMessage,
+		TruckID:     next.TruckID,
+		LamportTime: server.lamportClock,
+	}
+	respBytes, _ := json.Marshal(resp)
+	natsConnection.Publish(next.Reply, respBytes)
+}
 
 // ----------------------------- Data structures ----------------------------------
 
@@ -134,10 +203,10 @@ type TruckState string
 
 const (
 	StateExtinguishing TruckState = "EXTINGUISHING"
-	StateWaiting  TruckState = "WAITING_GRANT"
-	StateHeading  TruckState = "HEADING_BACK"
-	StateRefill   TruckState = "REFILLING"
-	StateIdle     TruckState = "SAVING_FUEL" // Idling at the fire department to save fuel
+	StateWaiting       TruckState = "WAITING_GRANT"
+	StateHeading       TruckState = "HEADING_BACK"
+	StateRefill        TruckState = "REFILLING"
+	StateIdle          TruckState = "SAVING_FUEL" // Idling at the fire department to save fuel
 )
 
 type Truck struct {
@@ -147,16 +216,20 @@ type Truck struct {
 	state         TruckState
 	refillGranted bool
 
+	// Refill request bookkeeping (Part 4b).
+	refillRequested bool               // True once a request has been sent and no refill has completed yet
+	grantCh         chan types.Message // Grant messages from the fire department are queued here by the NATS callback
+
 	helpInbox    chan types.Message //Truck inbox which stores the help messages
-	isHelping    bool //True if this truck has agreed to help another truck
-	helpX, helpY int //The coordinates where help is needed
-	
+	isHelping    bool               //True if this truck has agreed to help another truck
+	helpX, helpY int                //The coordinates where help is needed
+
 	lastHelpStep int // The last simulation step when this truck sent a help request (used for cooldown calculation).
 
 	lamportClock int // Lamport logical clock for this truck.
 
-	idleSteps    int  // Number of consecutive timesteps without encountering/fighting a fire.
-	isIdle       bool // True if the truck returned to the fire department to save fuel.
+	idleSteps int  // Number of consecutive timesteps without encountering/fighting a fire.
+	isIdle    bool // True if the truck returned to the fire department to save fuel.
 }
 
 type World struct {
@@ -220,12 +293,12 @@ func (w *World) spreadFires() {
 	}
 }
 
-//isBigFire returns true if a big fire is detected at coordinates (x, y)
+// isBigFire returns true if a big fire is detected at coordinates (x, y)
 func (w *World) isBigFire(x, y int) bool {
 	if !inBounds(x, y) {
 		return false
 	}
-	
+
 	c := w.grid[x][y]
 	if !c.fire || c.intensity < MaxIntensity {
 		return false
@@ -241,14 +314,39 @@ func (w *World) isBigFire(x, y int) bool {
 	return count >= BigFireNeighbourFiresCount
 }
 
-//Replaced the previous TCP client logic with NATS client logic
 // ----------------------------- NATS Client Logic ---------------------------------
 
-// tryRequestRefill sends a refill_request and waits for the reply.
-// Returns true if GRANTED and false if denied, timed out, or nobody is listening (true/false instead of returning the TCP connection)
+// grantSubject is the per-truck reply subject the fire department publishes
+// the refill grant to, e.g. "firedept.grant.T1".
+func grantSubject(id string) string {
+	return types.GrantSubjectPrefix + id
+}
 
-func tryRequestRefill(t *Truck) bool {
-	//when sending, increment local clock before sending a message.
+// subscribeGrant makes the truck listen for its refill grant. The callback only
+// queues the message; the truck processes it (and updates its Lamport clock) in
+// act(), on the simulation goroutine. It captures the channel and not the *Truck
+// because w.trucks is a slice that can be reallocated by append, which would
+// leave a captured pointer pointing at a stale copy.
+func subscribeGrant(t *Truck) error {
+	ch := t.grantCh
+	_, err := natsConnection.Subscribe(grantSubject(t.id), func(m *nats.Msg) {
+		var msg types.Message
+		if json.Unmarshal(m.Data, &msg) != nil || msg.Type != types.RefillGrantedMessage {
+			return
+		}
+		select {
+		case ch <- msg:
+		default:
+		}
+	})
+	return err
+}
+
+// sendRefillRequest publishes ONE refill request with the truck's Lamport
+// timestamp. The reply subject is the truck's own grant subject, so the fire
+// department can answer later, once the request reaches the head of the queue.
+func (t *Truck) sendRefillRequest() {
+	// Lamport send rule: increment local clock before sending a message.
 	t.lamportClock++
 	request := types.Message{
 		Type:        types.RefillRequestMessage,
@@ -256,26 +354,10 @@ func tryRequestRefill(t *Truck) bool {
 		LamportTime: t.lamportClock,
 	}
 	reqBytes, _ := json.Marshal(request)
-
-	// Deadline if the server does not reply because it is busy (timeout)
-	reply, err := natsConnection.Request(types.RefillSubject, reqBytes, 150*time.Millisecond)
-	if err != nil {
-		return false
-	}
-
-	var response types.Message
-	if err := json.Unmarshal(reply.Data, &response); err != nil {
-		return false
-	}
-
-	//Again we update local clock based on incoming message timestamp when receiving
-    t.lamportClock = max(t.lamportClock, response.LamportTime) + 1
-
-	return response.Type == types.RefillGrantedMessage
+	natsConnection.PublishRequest(types.RefillSubject, grantSubject(t.id), reqBytes)
 }
 
-
-//Trucks subscribe to the HelpSubject and the callback method queues the messages
+// Trucks subscribe to the HelpSubject and the callback method queues the messages
 func subscribeHelp(t *Truck) error {
 	_, err := natsConnection.Subscribe(types.HelpSubject, func(m *nats.Msg) { //the func() here is the callback function. It only queues the messages.
 		var msg types.Message
@@ -286,14 +368,14 @@ func subscribeHelp(t *Truck) error {
 
 		t.lamportClock = max(t.lamportClock, msg.LamportTime) + 1 //This is adding a timestamp
 		select {
-			case t.helpInbox <- msg: //If the message can be added to the inbox without having to wait (i.e. inbox not full), then queue the message
-			default: //If the inbox is full and the message has to wait, just skip it/ ignore it.
+		case t.helpInbox <- msg: //If the message can be added to the inbox without having to wait (i.e. inbox not full), then queue the message
+		default: //If the inbox is full and the message has to wait, just skip it/ ignore it.
 		}
 	})
 	return err
 }
 
-//Method called to publish help request with lamport clock
+// Method called to publish help request with lamport clock
 func (t *Truck) publishHelp(x, y int) {
 	//also increment clock before sending a message
 	t.lamportClock++
@@ -308,13 +390,13 @@ func (t *Truck) publishHelp(x, y int) {
 	natsConnection.Publish(types.HelpSubject, b)
 }
 
-//Trucks decide whether to help or not
+// Trucks decide whether to help or not
 func (t *Truck) handleHelpRequest() {
 	for {
 		select {
 		case m := <-t.helpInbox:
 			if m.TruckID == t.id || t.isHelping { //if the help is sent by itself or if it is already helping another truck
-				continue 
+				continue
 			}
 			dist := abs(t.x-m.X) + abs(t.y-m.Y)
 
@@ -323,7 +405,7 @@ func (t *Truck) handleHelpRequest() {
 				t.isHelping, t.helpX, t.helpY = true, m.X, m.Y
 
 				t.isIdle = false //If the truck is helping, it cannot be idling at the fire department to save fuel
-				t.idleSteps = 0 //Reset the idle steps counter since the truck is helping
+				t.idleSteps = 0  //Reset the idle steps counter since the truck is helping
 			}
 		default:
 			return
@@ -388,7 +470,7 @@ func (t *Truck) extinguish(w *World) {
 	}
 }
 
-//Returns the closest bigFire to the truck
+// Returns the closest bigFire to the truck
 func (t *Truck) detectBigFire(w *World) (int, int, bool) {
 	bestD := -1
 	var bx, by int
@@ -414,7 +496,7 @@ func (t *Truck) act(w *World) {
 	// A truck needs water if it is at 0 or still in the process of refilling
 	if t.water == 0 || t.refillGranted {
 		t.isHelping = false //If the water level has reached 0, the trucks cannot offer help
-		t.isIdle = false //If the truck is heading back to refill, it cannot be idling at the fire department to save fuel
+		t.isIdle = false    //If the truck is heading back to refill, it cannot be idling at the fire department to save fuel
 
 		// If at (0,0) with grant, remain stationary until full
 		if t.x == DeptX && t.y == DeptY && t.refillGranted {
@@ -422,15 +504,31 @@ func (t *Truck) act(w *World) {
 			return
 		}
 
-		// If no grant yet, try to obtain one from the server
+		// Send exactly ONE refill request; the fire department queues it and
+		// replies when this truck reaches the head of the queue.
+		if !t.refillRequested {
+			t.sendRefillRequest()
+			t.refillRequested = true
+		}
+
+		// Check (without blocking) whether the grant has arrived.
 		if !t.refillGranted {
-			if tryRequestRefill(t) { //I changed "t.id" to "t" because when requesting refill,
-									//we used to take ID string as parameter, and now it is "t*Truck"
+			select {
+			case g := <-t.grantCh:
+				// Lamport receive rule: C = max(C, C_msg) + 1
+				t.lamportClock = max(t.lamportClock, g.LamportTime) + 1
 				t.refillGranted = true
 				t.state = StateHeading
-			} else {
+			default:
 				t.state = StateWaiting
 			}
+		}
+
+		// Already at the station: wait here (or start refilling next step)
+		// instead of wandering off, since toward() returns a random direction
+		// when the truck is already at its target.
+		if t.x == DeptX && t.y == DeptY {
+			return
 		}
 
 		// Move towards firestation regardless of grant status
@@ -441,6 +539,7 @@ func (t *Truck) act(w *World) {
 	// Behaviour implemented when water > 0
 	t.state = StateExtinguishing
 	t.refillGranted = false
+	t.refillRequested = false
 
 	// Call for help when a big fire is detected
 	if bx, by, ok := t.detectBigFire(w); ok && w.step-t.lastHelpStep >= HelpCooldown {
@@ -453,7 +552,7 @@ func (t *Truck) act(w *World) {
 		t.isHelping = false
 	}
 
-	if t.isHelping && (t.x != t.helpX || t.y != t.helpY) {//If the truck has not reached the help location, move towards the help location
+	if t.isHelping && (t.x != t.helpX || t.y != t.helpY) { //If the truck has not reached the help location, move towards the help location
 		t.idleSteps = 0
 		t.isIdle = false
 		t.move(w, toward(t.x, t.y, t.helpX, t.helpY))
@@ -475,13 +574,13 @@ func (t *Truck) act(w *World) {
 		t.isIdle = false
 		t.move(w, toward(t.x, t.y, fx, fy))
 		return
-	} 
+	}
 
 	t.idleSteps++ //Increment idle steps when no fire is detected and the truck is not moving towards a fire
 
 	//If no fire encountered for q consecutive timestamps
 	if t.idleSteps >= IdleThreshold {
-		
+
 		// If already idling at the station, stays there until a new fire is detected
 		if t.isIdle && t.x == DeptX && t.y == DeptY {
 			t.state = StateIdle
@@ -517,6 +616,10 @@ func serviceStationRefill(w *World) {
 	server.mu.Lock()
 	defer server.mu.Unlock()
 
+	// Once per timestep: if the reservoir is free, grant it to the head of the
+	// (timestamp, truck_id) priority queue.
+	grantNext()
+
 	if server.status != "BUSY" {
 		return
 	}
@@ -532,9 +635,10 @@ func serviceStationRefill(w *World) {
 				if t.water >= TruckWaterCap {
 					t.water = TruckWaterCap
 					t.refillGranted = false
+					t.refillRequested = false
 					t.state = StateExtinguishing
 
-					// Reservoir is now available for the waiting truck
+					// Reservoir is now available for the next truck in the queue
 					server.status = "FREE"
 					server.currentTruck = ""
 				}
@@ -665,8 +769,9 @@ func display(w *World) {
 		fmt.Printf("  %s: %d/%d [%s]", t.id, t.water, TruckWaterCap, t.state)
 	}
 	server.mu.Lock()
-	fmt.Printf("  Station: [%s, serving:%s]", server.status, server.currentTruck)
+	fmt.Printf("  Station: [%s, serving:%s]  Queue: [%s]", server.status, server.currentTruck, server.queue.snapshot())
 	server.mu.Unlock()
+	fmt.Print("\033[K") // clear leftover characters from a longer previous line
 	fmt.Println()
 }
 
@@ -691,18 +796,24 @@ func main() {
 			{
 				id: "T1", x: 0, y: 2, water: TruckWaterCap, state: StateExtinguishing,
 				helpInbox: make(chan types.Message, HelpInboxCap), lastHelpStep: -HelpCooldown,
+				grantCh: make(chan types.Message, 1),
 			},
 			{
 				id: "T2", x: 5, y: 5, water: TruckWaterCap, state: StateExtinguishing,
 				helpInbox: make(chan types.Message, HelpInboxCap), lastHelpStep: -HelpCooldown,
+				grantCh: make(chan types.Message, 1),
 			},
 		},
 	}
 
-	//Subscribe all trucks to the help topic
+	//Subscribe all trucks to the help topic and to their own grant subject
 	for i := range w.trucks {
 		if err := subscribeHelp(&w.trucks[i]); err != nil {
 			fmt.Printf("Could not subscribe to help subject")
+			return
+		}
+		if err := subscribeGrant(&w.trucks[i]); err != nil {
+			fmt.Printf("Could not subscribe to grant subject")
 			return
 		}
 	}
@@ -748,7 +859,6 @@ func main() {
 			w.trucks[i].lamportClock++
 		}
 
-
 		if w.step%FireIntensifyEvery == 0 {
 			w.intensifyFires()
 		}
@@ -780,9 +890,11 @@ func main() {
 				newTruck := Truck{
 					id: newID, x: DeptX, y: DeptY, water: TruckWaterCap, state: StateExtinguishing,
 					helpInbox: make(chan types.Message, HelpInboxCap), lastHelpStep: -HelpCooldown,
+					grantCh: make(chan types.Message, 1),
 				}
 				w.trucks = append(w.trucks, newTruck)
 				go subscribeHelp(&w.trucks[len(w.trucks)-1]) // Subscribe the new truck to help messages.
+				subscribeGrant(&w.trucks[len(w.trucks)-1])   // Subscribe the new truck to its refill grant subject.
 				lastDeployStep = w.step
 				activeHelpRequests = make(map[string]int) // Reset the concurrent help counter.
 				worldMutex.Unlock()
@@ -790,7 +902,7 @@ func main() {
 		default:
 		}
 
-		// Request refill over TCP, navigate home, or wait/extinguish
+		// Trucks act: request a refill, wait for the grant, navigate home, or extinguish.
 		// Protect the trucks slice while iterating and updating truck states,
 		// because new trucks may be appended by the deployment logic above.
 		worldMutex.Lock()
@@ -798,14 +910,15 @@ func main() {
 			w.trucks[i].act(&w)
 		}
 
-		// Fire department refills the served truck at (0,0) until full
+		// Fire department grants the reservoir to the head of the queue (if free)
+		// and refills the served truck at (0,0) until full
 		serviceStationRefill(&w)
 		worldMutex.Unlock()
 
 		worldMutex.Lock()
 		display(&w)
 		worldMutex.Unlock()
-		
+
 		if w.step >= SimTimesteps {
 			fmt.Println("Simulation ended.")
 			return
@@ -815,8 +928,8 @@ func main() {
 	}
 }
 
-//in case our version of go doesn't have a package for max func
-//this func returns the larger int among 2
+// in case our version of go doesn't have a package for max func
+// this func returns the larger int among 2
 func max(a, b int) int {
 	if a > b {
 		return a
