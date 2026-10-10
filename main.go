@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
-	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -167,7 +166,6 @@ func handleRefillRequest(message *nats.Msg) {
 		Lamport: request.LamportTime,
 		Reply:   message.Reply,
 	})
-	fmt.Fprintf(os.Stderr, "ENQUEUE %s L=%d | queue: %s\n", request.TruckID, request.LamportTime, server.queue.snapshot())
 }
 
 // grantNext grants the reservoir to the head of the queue if the reservoir is FREE.
@@ -192,8 +190,6 @@ func grantNext() {
 	}
 	respBytes, _ := json.Marshal(resp)
 	natsConnection.Publish(next.Reply, respBytes)
-
-	fmt.Fprintf(os.Stderr, "GRANT   %s L=%d | still waiting: %s\n", next.TruckID, next.Lamport, server.queue.snapshot())
 }
 
 // ----------------------------- Data structures ----------------------------------
