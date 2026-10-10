@@ -1,9 +1,6 @@
 # Truck action logs (Part 4c)
 logs/
 
-# Debug trace of the refill queue (Part 4b)
-queue-trace.txt
-
 # Go build output
 /dit-357-lab-group-6
 *.exe
