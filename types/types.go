@@ -14,4 +14,5 @@ type Message struct {
 	TruckID string `json:"truck_id"` // "T1", "T2"
 	X       int    `json:"x,omitempty"` 
 	Y       int    `json:"y,omitempty"`
+	LamportTime int    `json:"lamport_time,omitempty"` //store lampoert logical clock value from the sender
 }
