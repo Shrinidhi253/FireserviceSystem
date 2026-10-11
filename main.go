@@ -639,27 +639,7 @@ func (t *Truck) fightFire(w *World) bool { //it returns true if the truck used i
 	return false
 }
 
-func (t *Truck) act(w *World) {
-	t.handleHelpRequest()
-
-	// A truck needs water if it is at 0 or still in the process of refilling
-	if t.water == 0 || t.refillGranted {
-		t.goRefill(w)
-		return
-	}
-
-	// Behaviour implemented when water > 0
-	t.state = StateExtinguishing
-	t.refillGranted = false
-	t.refillRequested = false
-
-	t.callForHelpIfBigFire(w)
-
-	//Check if the truck can use its turn to help other truck or extinguish fire
-	if t.driveToHelp(w) || t.fightFire(w) {
-		return //If the turn has been used, end
-	}
-
+func (t *Truck) idleOrPatrol(w *World) {
 	t.idleSteps++ //Increment idle steps when no fire is detected and the truck is not moving towards a fire
 
 	//If no fire encountered for q consecutive timestamps
@@ -692,6 +672,31 @@ func (t *Truck) act(w *World) {
 	t.isIdle = false
 	t.state = StateExtinguishing
 	t.move(w, randomDir())
+}
+
+func (t *Truck) act(w *World) {
+	t.handleHelpRequest()
+
+	// A truck needs water if it is at 0 or still in the process of refilling
+	if t.water == 0 || t.refillGranted {
+		t.goRefill(w)
+		return
+	}
+
+	// Behaviour implemented when water > 0
+	t.state = StateExtinguishing
+	t.refillGranted = false
+	t.refillRequested = false
+
+	t.callForHelpIfBigFire(w)
+
+	//Check if the truck can use its turn to help other truck or extinguish fire
+	if t.driveToHelp(w) || t.fightFire(w) {
+		return //If the turn has been used, end
+	}
+
+	//Else check if the truck needs to go into idle mode or continue patroling
+	t.idleOrPatrol(w)
 }
 
 // ----------------------------- Refill Service -----------------------------------
