@@ -58,7 +58,7 @@ const (
 	// Number of distinct concurrent help requests required to trigger a new truck deployment.
 	MaxConcurrentHelpRequests = 2
 	//Number of steps after which a help request no longer counts as "concurrent"
-	HelpRequestExpiry = HelpRequestExpiry
+	HelpRequestExpiry = 20
 
 	//Fuel saving parameters
 	IdleThreshold  = 5 //Number of simultation steps without fire after which the truck returns to the dept
@@ -110,6 +110,18 @@ type World struct {
 	grid   [GridSize][GridSize]Cell
 	trucks []Truck // Changed from fixed-size array to slice to support dynamic truck additions.
 	step   int
+}
+
+//Returns a newly deployed truck object
+func spawnNewTruck(id string, x, y int) Truck {
+	return Truck {
+		id: id,
+		x: x, y: y,
+		water: TruckWaterCap,
+		state: StateExtinguishing,
+		helpInbox: make(chan types.Message, HelpInboxCap), lastHelpStep: -HelpCooldown,
+		grantCh: make(chan types.Message, 1),
+	}
 }
 
 // countActiveInField counts trucks that are not idling at (0,0) saving fuel
@@ -899,16 +911,8 @@ func main() {
 
 	w := World{
 		trucks: []Truck{ // Slice instead of array, so we can append new trucks at runtime.
-			{
-				id: "T1", x: 0, y: 2, water: TruckWaterCap, state: StateExtinguishing,
-				helpInbox: make(chan types.Message, HelpInboxCap), lastHelpStep: -HelpCooldown,
-				grantCh: make(chan types.Message, 1),
-			},
-			{
-				id: "T2", x: 5, y: 5, water: TruckWaterCap, state: StateExtinguishing,
-				helpInbox: make(chan types.Message, HelpInboxCap), lastHelpStep: -HelpCooldown,
-				grantCh: make(chan types.Message, 1),
-			},
+			spawnNewTruck("T1", 0, 2),
+			spawnNewTruck("T2", 5, 5),
 		},
 	}
 
@@ -993,12 +997,10 @@ func main() {
 			if len(activeHelpRequests) >= MaxConcurrentHelpRequests && len(w.trucks) < MaxTrucks && w.step-lastDeployStep >= DeployCooldown {
 				worldMutex.Lock()
 				newID := fmt.Sprintf("T%d", len(w.trucks)+1) // Generate T3, T4, T5, ...
-				newTruck := Truck{
-					id: newID, x: DeptX, y: DeptY, water: TruckWaterCap, state: StateExtinguishing,
-					helpInbox: make(chan types.Message, HelpInboxCap), lastHelpStep: -HelpCooldown,
-					grantCh: make(chan types.Message, 1),
-				}
+				
+				newTruck := spawnNewTruck(newID, DeptX, DeptY)
 				w.trucks = append(w.trucks, newTruck)
+				
 				go subscribeHelp(&w.trucks[len(w.trucks)-1]) // Subscribe the new truck to help messages.
 				subscribeGrant(&w.trucks[len(w.trucks)-1])   // Subscribe the new truck to its refill grant subject.
 				lastDeployStep = w.step
