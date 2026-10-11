@@ -344,12 +344,6 @@ func (w *World) isBigFire(x, y int) bool {
 
 // ----------------------------- NATS Client Logic ---------------------------------
 
-// grantSubject is the per-truck reply subject the fire department publishes
-// the refill grant to, e.g. "firedept.grant.T1".
-func grantSubject(id string) string {
-	return types.GrantSubjectPrefix + id
-}
-
 // subscribeGrant makes the truck listen for its refill grant. The callback only
 // queues the message; the truck processes it (and updates its Lamport clock) in
 // act(), on the simulation goroutine. It captures the channel and not the *Truck
@@ -357,7 +351,7 @@ func grantSubject(id string) string {
 // leave a captured pointer pointing at a stale copy.
 func subscribeGrant(t *Truck) error {
 	ch := t.grantCh
-	_, err := natsConnection.Subscribe(grantSubject(t.id), func(m *nats.Msg) {
+	_, err := natsConnection.Subscribe(types.GrantSubject(t.id), func(m *nats.Msg) {
 		var msg types.Message
 		if json.Unmarshal(m.Data, &msg) != nil || msg.Type != types.RefillGrantedMessage {
 			return
@@ -382,7 +376,7 @@ func (t *Truck) sendRefillRequest() {
 		LamportTime: t.lamportClock,
 	}
 	reqBytes, _ := json.Marshal(request)
-	natsConnection.PublishRequest(types.RefillSubject, grantSubject(t.id), reqBytes)
+	natsConnection.PublishRequest(types.RefillSubject, types.GrantSubject(t.id), reqBytes)
 	logEvent(t.id, t.lamportClock, "refill_request", "")
 }
 
@@ -411,6 +405,7 @@ func (t *Truck) publishHelp(x, y int) {
 	msg := types.Message{
 		Type:        types.HelpRequestMessage,
 		TruckID:     t.id,
+		FireID: 	 types.FireName(x, y),	
 		X:           x,
 		Y:           y,
 		LamportTime: t.lamportClock,
