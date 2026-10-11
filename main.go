@@ -19,7 +19,7 @@ import (
 // ----------------------------- Configuration ------------------------------------
 
 const (
-	GridSize     = 20
+	GridSize     = HelpRequestExpiry
 	SimTimesteps = 140
 	TickMs       = 600
 
@@ -57,6 +57,8 @@ const (
 	DeployCooldown = 10
 	// Number of distinct concurrent help requests required to trigger a new truck deployment.
 	MaxConcurrentHelpRequests = 2
+	//Number of steps after which a help request no longer counts as "concurrent"
+	HelpRequestExpiry = HelpRequestExpiry
 
 	//Fuel saving parameters
 	IdleThreshold  = 5 //Number of simultation steps without fire after which the truck returns to the dept
@@ -654,7 +656,7 @@ func (t *Truck) idleOrPatrol(w *World) {
 	if t.idleSteps >= IdleThreshold {
 
 		// If already idling at the station, stays there until a new fire is detected
-		if t.atDept() {
+		if t.isIdle && t.atDept() {
 			t.state = StateIdle
 			return
 		}
@@ -973,10 +975,10 @@ func main() {
 			w.addFire(rand.Intn(GridSize), rand.Intn(GridSize))
 		}
 
-		// Remove help requests that are older than 20 simulation steps.
+		// Remove help requests that are older than HelpRequestExpiry simulation steps.
 		// This keeps the active help request count relevant and up-to-date.
 		for id, step := range activeHelpRequests {
-			if w.step-step > 20 {
+			if w.step-step > HelpRequestExpiry {
 				delete(activeHelpRequests, id)
 			}
 		}
