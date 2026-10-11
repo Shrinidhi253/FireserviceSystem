@@ -168,6 +168,17 @@ func (s *FireDepartmentServer) lamportReceive(remote int) {
 	s.lamportClock = max(s.lamportClock, remote) + 1
 }
 
+//tickClocks advances every lamport clock by one local event per timestamp
+func (w *World) tickClocks() {
+	server.mu.Lock()
+	server.lamportTick()
+	server.mu.Unlock()
+
+	for i := range w.trucks {
+		w.trucks[i].lamportTick()
+	}
+}
+
 // ----------------------------- Server State -------------------------------------
 
 // refillEntry is one pending refill request waiting in the fire department's queue.
@@ -961,13 +972,7 @@ func main() {
 		w.step++
 
 		//increment on every local event as lamport clock, one per step
-
-		server.mu.Lock()
-		server.lamportTick()
-		server.mu.Unlock()
-		for i := range w.trucks {
-			w.trucks[i].lamportTick()
-		}
+		w.tickClocks()
 
 		if w.step%FireIntensifyEvery == 0 {
 			w.intensifyFires()
