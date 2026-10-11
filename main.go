@@ -875,6 +875,12 @@ func nearestFire(w *World, x, y int) (int, int, bool) {
 }
 
 func occupied(w *World, x, y int, skipID string) bool {
+	// The fire department can hold any number of trucks.
+	// Without this, a truck waiting for its grant (or idling) at (0,0)
+	// can block the truck that actually holds the grant -> deadlock.
+	if x == DeptX && y == DeptY {
+		return false
+	}
 	for _, t := range w.trucks {
 		if t.id != skipID && t.x == x && t.y == y {
 			return true
