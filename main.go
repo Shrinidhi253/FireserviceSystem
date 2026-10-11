@@ -553,51 +553,55 @@ func (t *Truck) detectBigFire(w *World) (int, int, bool) {
 
 }
 
+func (t *Truck) goRefill(w * World) {
+	t.isHelping = false //If the water level has reached 0, the trucks cannot offer help
+	t.isIdle = false    //If the truck is heading back to refill, it cannot be idling at the fire department to save fuel
+
+	// If at (0,0) with grant, remain stationary until full
+	if t.x == DeptX && t.y == DeptY && t.refillGranted {
+		t.state = StateRefill
+		return
+	}
+
+	// Send exactly ONE refill request; the fire department queues it and
+	// replies when this truck reaches the head of the queue.
+	if !t.refillRequested {
+		t.sendRefillRequest()
+		t.refillRequested = true
+	}
+
+	// Check (without blocking) whether the grant has arrived.
+	if !t.refillGranted {
+		select {
+		case g := <-t.grantCh:
+			// Lamport receive rule: C = max(C, C_msg) + 1
+			t.lamportReceive(g.LamportTime)
+
+			t.refillGranted = true
+			t.state = StateHeading
+			logEvent(t.id, t.lamportClock, "refill_granted", "")
+		default:
+			t.state = StateWaiting
+		}
+	}
+
+	// Already at the station: wait here (or start refilling next step)
+	// instead of wandering off, since toward() returns a random direction
+	// when the truck is already at its target.
+	if t.x == DeptX && t.y == DeptY {
+		return
+	}
+
+	// Move towards firestation regardless of grant status
+	t.move(w, toward(t.x, t.y, DeptX, DeptY))
+}
+
 func (t *Truck) act(w *World) {
 	t.handleHelpRequest()
 
 	// A truck needs water if it is at 0 or still in the process of refilling
 	if t.water == 0 || t.refillGranted {
-		t.isHelping = false //If the water level has reached 0, the trucks cannot offer help
-		t.isIdle = false    //If the truck is heading back to refill, it cannot be idling at the fire department to save fuel
-
-		// If at (0,0) with grant, remain stationary until full
-		if t.x == DeptX && t.y == DeptY && t.refillGranted {
-			t.state = StateRefill
-			return
-		}
-
-		// Send exactly ONE refill request; the fire department queues it and
-		// replies when this truck reaches the head of the queue.
-		if !t.refillRequested {
-			t.sendRefillRequest()
-			t.refillRequested = true
-		}
-
-		// Check (without blocking) whether the grant has arrived.
-		if !t.refillGranted {
-			select {
-			case g := <-t.grantCh:
-				// Lamport receive rule: C = max(C, C_msg) + 1
-				t.lamportReceive(g.LamportTime)
-
-				t.refillGranted = true
-				t.state = StateHeading
-				logEvent(t.id, t.lamportClock, "refill_granted", "")
-			default:
-				t.state = StateWaiting
-			}
-		}
-
-		// Already at the station: wait here (or start refilling next step)
-		// instead of wandering off, since toward() returns a random direction
-		// when the truck is already at its target.
-		if t.x == DeptX && t.y == DeptY {
-			return
-		}
-
-		// Move towards firestation regardless of grant status
-		t.move(w, toward(t.x, t.y, DeptX, DeptY))
+		t.goRefill(w)
 		return
 	}
 
