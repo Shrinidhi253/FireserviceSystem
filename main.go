@@ -456,8 +456,6 @@ func subscribeHelp(t *Truck) error {
 			return
 		}
 
-		t.lamportReceive(msg.LamportTime) //This is adding a timestamp
-		
 		select {
 			case t.helpInbox <- msg: //If the message can be added to the inbox without having to wait (i.e. inbox not full), then queue the message
 			default: //If the inbox is full and the message has to wait, just skip it/ ignore it.
@@ -499,6 +497,8 @@ func (t *Truck) handleHelpRequest() {
 	for {
 		select {
 		case m := <-t.helpInbox:
+			t.lamportReceive(m.LamportTime) //Lamport receive rule
+
 			if m.TruckID == t.id || t.isHelping { //if the help is sent by itself or if it is already helping another truck
 				continue
 			}
@@ -851,8 +851,9 @@ func deployTruck(w *World) {
 	newID := fmt.Sprintf("T%d", len(w.trucks)+1)
 	w.trucks = append(w.trucks, spawnNewTruck(newID, DeptX, DeptY))
 
-	go subscribeHelp(&w.trucks[len(w.trucks) - 1])
-	subscribeGrant(&w.trucks[len(w.trucks) - 1])
+	if err := subscribeTruckToAllSubjects(&w.trucks[len(w.trucks) - 1]); err != nil {
+		fmt.Printf("Could not subscribe %s: %v\n", newID, err)
+	}
 }
 
 // ----------------------------- Helper functions ---------------------------------
