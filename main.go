@@ -596,6 +596,49 @@ func (t *Truck) goRefill(w * World) {
 	t.move(w, toward(t.x, t.y, DeptX, DeptY))
 }
 
+func (t *Truck) callForHelpIfBigFire(w *World) {
+	// Call for help when a big fire is detected
+	if bx, by, ok := t.detectBigFire(w); ok && w.step-t.lastHelpStep >= HelpCooldown {
+		t.publishHelp(bx, by)
+		t.lastHelpStep = w.step
+	}
+}
+
+func (t *Truck) driveToHelp(w *World) bool { //returns true is the truck used its turn to 
+	if t.isHelping && !w.grid[t.helpX][t.helpY].fire { //If the fire is out at the location, then no need to help out
+		t.isHelping = false
+	}
+
+	if t.isHelping && (t.x != t.helpX || t.y != t.helpY) { //If the truck has not reached the help location, move towards the help location
+		t.idleSteps = 0
+		t.isIdle = false
+		t.move(w, toward(t.x, t.y, t.helpX, t.helpY))
+		return true
+	}
+	return false
+}
+
+func (t *Truck) fightFire(w *World) bool { //it returns true if the truck used it's turn to extinguish the fire
+	//Extinguising fire on current cell
+	if w.grid[t.x][t.y].fire {
+		t.idleSteps = 0 //Reset idle steps when encountering a fire
+		t.isIdle = false
+		t.extinguish(w)
+		return true
+	}
+
+	//Move towards nearest fire anywhere on the grid
+	fx, fy, ok := nearestFire(w, t.x, t.y)
+	if ok {
+		t.idleSteps = 0 //Reset idle steps when moving towards a fire
+		t.isIdle = false
+		t.move(w, toward(t.x, t.y, fx, fy))
+		return true
+	}
+
+	return false
+}
+
 func (t *Truck) act(w *World) {
 	t.handleHelpRequest()
 
@@ -610,39 +653,11 @@ func (t *Truck) act(w *World) {
 	t.refillGranted = false
 	t.refillRequested = false
 
-	// Call for help when a big fire is detected
-	if bx, by, ok := t.detectBigFire(w); ok && w.step-t.lastHelpStep >= HelpCooldown {
-		t.publishHelp(bx, by)
-		t.lastHelpStep = w.step
-	}
+	t.callForHelpIfBigFire(w)
 
-	//Navigation for Assitance
-	if t.isHelping && !w.grid[t.helpX][t.helpY].fire { //If the fire is out at the location, then no need to help out
-		t.isHelping = false
-	}
-
-	if t.isHelping && (t.x != t.helpX || t.y != t.helpY) { //If the truck has not reached the help location, move towards the help location
-		t.idleSteps = 0
-		t.isIdle = false
-		t.move(w, toward(t.x, t.y, t.helpX, t.helpY))
-		return
-	}
-
-	//Extinguising fire on current cell
-	if w.grid[t.x][t.y].fire {
-		t.idleSteps = 0 //Reset idle steps when encountering a fire
-		t.isIdle = false
-		t.extinguish(w)
-		return
-	}
-
-	//Move towards nearest fire anywhere on the grid
-	fx, fy, ok := nearestFire(w, t.x, t.y)
-	if ok {
-		t.idleSteps = 0 //Reset idle steps when moving towards a fire
-		t.isIdle = false
-		t.move(w, toward(t.x, t.y, fx, fy))
-		return
+	//Check if the truck can use its turn to help other truck or extinguish fire
+	if t.driveToHelp(w) || t.fightFire(w) {
+		return //If the turn has been used, end
 	}
 
 	t.idleSteps++ //Increment idle steps when no fire is detected and the truck is not moving towards a fire
