@@ -121,6 +121,17 @@ func countActiveInField(w *World) int {
 	return active
 }
 
+//reports whether the truck is at the fire department
+func (t *Truck) atDept() bool {
+	return t.x == DeptX && t.y == DeptY
+} 
+
+//resets the fuel-saving state
+func (t *Truck) endFuelSavingMode() {
+	t.idleSteps = 0
+	t.isIdle = false
+}
+
 //----------------------------- Lamport clocks -------------------------------------
 //Lamport clock is a counter that orders events without synchronised wall clocks
 //	1. Local event: clock++
@@ -454,8 +465,7 @@ func (t *Truck) handleHelpRequest() {
 			if t.water >= HelpMinWater && !t.refillGranted && dist <= HelpMaxDistance {
 				t.isHelping, t.helpX, t.helpY = true, m.X, m.Y
 
-				t.isIdle = false //If the truck is helping, it cannot be idling at the fire department to save fuel
-				t.idleSteps = 0  //Reset the idle steps counter since the truck is helping
+				t.endFuelSavingMode() //If the truck is helping, it cannot be idling at the fire department to save fuel
 			}
 		default:
 			return
@@ -558,7 +568,7 @@ func (t *Truck) goRefill(w * World) {
 	t.isIdle = false    //If the truck is heading back to refill, it cannot be idling at the fire department to save fuel
 
 	// If at (0,0) with grant, remain stationary until full
-	if t.x == DeptX && t.y == DeptY && t.refillGranted {
+	if t.atDept() && t.refillGranted {
 		t.state = StateRefill
 		return
 	}
@@ -588,7 +598,7 @@ func (t *Truck) goRefill(w * World) {
 	// Already at the station: wait here (or start refilling next step)
 	// instead of wandering off, since toward() returns a random direction
 	// when the truck is already at its target.
-	if t.x == DeptX && t.y == DeptY {
+	if t.atDept() {
 		return
 	}
 
@@ -610,8 +620,7 @@ func (t *Truck) driveToHelp(w *World) bool { //returns true is the truck used it
 	}
 
 	if t.isHelping && (t.x != t.helpX || t.y != t.helpY) { //If the truck has not reached the help location, move towards the help location
-		t.idleSteps = 0
-		t.isIdle = false
+		t.endFuelSavingMode()
 		t.move(w, toward(t.x, t.y, t.helpX, t.helpY))
 		return true
 	}
@@ -621,8 +630,7 @@ func (t *Truck) driveToHelp(w *World) bool { //returns true is the truck used it
 func (t *Truck) fightFire(w *World) bool { //it returns true if the truck used it's turn to extinguish the fire
 	//Extinguising fire on current cell
 	if w.grid[t.x][t.y].fire {
-		t.idleSteps = 0 //Reset idle steps when encountering a fire
-		t.isIdle = false
+		t.endFuelSavingMode()
 		t.extinguish(w)
 		return true
 	}
@@ -646,7 +654,7 @@ func (t *Truck) idleOrPatrol(w *World) {
 	if t.idleSteps >= IdleThreshold {
 
 		// If already idling at the station, stays there until a new fire is detected
-		if t.isIdle && t.x == DeptX && t.y == DeptY {
+		if t.atDept() {
 			t.state = StateIdle
 			return
 		}
@@ -654,7 +662,7 @@ func (t *Truck) idleOrPatrol(w *World) {
 		// Check if returning would leave at least MinFieldTrucks active
 		if countActiveInField(w) > MinFieldTrucks {
 			// Check if we just reached the station (0,0)
-			if t.x == DeptX && t.y == DeptY {
+			if t.atDept() {
 				t.isIdle = true
 				t.state = StateIdle // Only becomes SAVING_FUEL at (0,0)
 				return
@@ -717,7 +725,7 @@ func serviceStationRefill(w *World) {
 		t := &w.trucks[i]
 		if t.id == server.currentTruck {
 			// Can only refill at the fire department (0,0) and grant permit
-			if t.x == DeptX && t.y == DeptY && t.refillGranted {
+			if t.atDept() && t.refillGranted {
 				t.water += RefillRate
 
 				// Close connection when completely refilled
