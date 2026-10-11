@@ -19,7 +19,7 @@ import (
 // ----------------------------- Configuration ------------------------------------
 
 const (
-	GridSize     = HelpRequestExpiry
+	GridSize     = 20
 	SimTimesteps = 140
 	TickMs       = 600
 
@@ -466,6 +466,17 @@ func subscribeHelp(t *Truck) error {
 	return err
 }
 
+//Subscribe the trucks to both grant and help topic 
+func subscribeTruckToAllSubjects(t *Truck) error {
+	if err := subscribeHelp(t); err != nil 	{
+		return fmt.Errorf("help subject: %w", err)
+	}
+	if err := subscribeGrant(t); err != nil {
+		return fmt.Errorf("grant subject: %w", err)
+	}
+	return nil
+}
+
 // Method called to publish help request with lamport clock
 func (t *Truck) publishHelp(x, y int) {
 	//also increment clock before sending a message
@@ -777,6 +788,73 @@ func serviceStationRefill(w *World) {
 	}
 }
 
+// ----------------------------- Truck deployment ---------------------------------
+
+//Deploy monitor listens to the help subject and deploys a new truck when the required amount of trucks have called for help concurrently
+type deployMonitor struct {
+	requests		chan string 	//IDs of trucks that called for help, filled by the NATS callback
+	recent			map[string]int	//truckID -> step of its latest help call
+	lastDeployStep	int
+}
+
+func newDeployMonitor() (*deployMonitor, error) {
+	d := &deployMonitor{
+		requests: make(chan string, 100),
+		recent:	make(map[string]int),
+		lastDeployStep: -DeployCooldown,	
+	}
+
+	requests := d.requests
+	_, err := natsConnection.Subscribe(types.HelpSubject, func(m *nats.Msg) { //Subscribe to the help subject and listen to how many trucks are calling for help
+		var msg types.Message
+
+		if json.Unmarshal(m.Data, &msg) != nil || msg.Type != types.HelpRequestMessage {
+			return
+		}
+
+		select {
+			case requests <- msg.TruckID:
+			default:
+		}
+	})
+	return d, err	
+}
+
+//updates the requests by deleting old help requests or deploying trucks if needed
+func (d *deployMonitor) handleConcurrentRequests(w *World) {
+	//Forget help requests that are too old to count as concurrent
+	for id, step := range d.recent {
+		if w.step - step > HelpRequestExpiry {delete(d.recent, id)}
+	}
+
+	select {
+		case truckID := <- d.requests:
+			d.recent[truckID] = w.step
+
+			if 	len(d.recent) >= MaxConcurrentHelpRequests &&
+				len(w.trucks) < MaxTrucks &&
+				w.step - d.lastDeployStep >= DeployCooldown {
+					deployTruck(w)
+					d.lastDeployStep = w.step
+					d.recent = make(map[string]int)
+				}
+
+		default:
+	}
+}
+
+//adds a new truck (T3, T4, ....) at the fire dept and subscribes it to all its subjects
+func deployTruck(w *World) {
+	worldMutex.Lock()
+	defer worldMutex.Unlock()
+
+	newID := fmt.Sprintf("T%d", len(w.trucks)+1)
+	w.trucks = append(w.trucks, spawnNewTruck(newID, DeptX, DeptY))
+
+	go subscribeHelp(&w.trucks[len(w.trucks) - 1])
+	subscribeGrant(&w.trucks[len(w.trucks) - 1])
+}
+
 // ----------------------------- Helper functions ---------------------------------
 
 func nearestFire(w *World, x, y int) (int, int, bool) {
@@ -936,40 +1014,17 @@ func main() {
 
 	//Subscribe all trucks to the help topic and to their own grant subject
 	for i := range w.trucks {
-		if err := subscribeHelp(&w.trucks[i]); err != nil {
-			fmt.Printf("Could not subscribe to help subject")
-			return
-		}
-		if err := subscribeGrant(&w.trucks[i]); err != nil {
-			fmt.Printf("Could not subscribe to grant subject")
+		if err := subscribeTruckToAllSubjects(&w.trucks[i]); err != nil {
+			fmt.Printf("could not subscribe %s: %v\n", w.trucks[i].id, err)
 			return
 		}
 	}
 
-	// Channel used by the NATS callback to notify the main loop of help requests.
-	deployRequestChan := make(chan string, 100)
-
-	// Subscribe to the help subject solely for the purpose of truck deployment.
-	// Every help request is forwarded to deployRequestChan.
-	_, err = natsConnection.Subscribe(types.HelpSubject, func(m *nats.Msg) {
-		var msg types.Message
-		if json.Unmarshal(m.Data, &msg) != nil || msg.Type != types.HelpRequestMessage {
-			return
-		}
-		select {
-		case deployRequestChan <- msg.TruckID:
-		default:
-		}
-	})
+	deployMonitor, err := newDeployMonitor()
 	if err != nil {
-		fmt.Printf("Could not subscribe to help subject for deployment")
+		fmt.Printf("could not subscribe for truck deployment: %v\n", err)
 		return
 	}
-
-	// Tracks which trucks have requested help recently, to avoid double-counting
-	// the same truck and to measure concurrent help requests.
-	activeHelpRequests := make(map[string]int)
-	lastDeployStep := -DeployCooldown
 
 	w.addFire(0, 11)
 	w.addFire(11, 7)
@@ -980,41 +1035,9 @@ func main() {
 
 		w.tickClocks() //increment on every local event as lamport clock, one per step
 		w.decideFireDynamic()
-
-		// Remove help requests that are older than HelpRequestExpiry simulation steps.
-		// This keeps the active help request count relevant and up-to-date.
-		for id, step := range activeHelpRequests {
-			if w.step-step > HelpRequestExpiry {
-				delete(activeHelpRequests, id)
-			}
-		}
-
-		// Check for new help requests and deploy a new truck if conditions are met:
-		// - At least MaxConcurrentHelpRequests distinct trucks have requested help concurrently.
-		// - Total number of trucks is below MaxTrucks.
-		// - Enough simulation steps have passed since the last deployment (DeployCooldown).
-		select {
-		case truckID := <-deployRequestChan:
-			activeHelpRequests[truckID] = w.step
-			if len(activeHelpRequests) >= MaxConcurrentHelpRequests && len(w.trucks) < MaxTrucks && w.step-lastDeployStep >= DeployCooldown {
-				worldMutex.Lock()
-				newID := fmt.Sprintf("T%d", len(w.trucks)+1) // Generate T3, T4, T5, ...
-				
-				newTruck := spawnNewTruck(newID, DeptX, DeptY)
-				w.trucks = append(w.trucks, newTruck)
-				
-				go subscribeHelp(&w.trucks[len(w.trucks)-1]) // Subscribe the new truck to help messages.
-				subscribeGrant(&w.trucks[len(w.trucks)-1])   // Subscribe the new truck to its refill grant subject.
-				lastDeployStep = w.step
-				activeHelpRequests = make(map[string]int) // Reset the concurrent help counter.
-				worldMutex.Unlock()
-			}
-		default:
-		}
+		deployMonitor.handleConcurrentRequests(&w) //decides whether to deploy new trucks or delete old requests
 
 		// Trucks act: request a refill, wait for the grant, navigate home, or extinguish.
-		// Protect the trucks slice while iterating and updating truck states,
-		// because new trucks may be appended by the deployment logic above.
 		worldMutex.Lock()
 		for i := range w.trucks {
 			w.trucks[i].act(&w)
