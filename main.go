@@ -47,9 +47,9 @@ const (
 
 	//Call for help
 	HelpMinWater    = TruckWaterCap / 2 //Only help if the water level is at least half of the maximum capacity
-	HelpMaxDistance = 10                //Only help if it takes at most 10 up/down/right/left steps to reach the fire
+	HelpMaxDistance = 10                //Only help if it takes at most these many up/down/right/left steps to reach the fire
 	HelpCooldown    = 10                //The no. of simulation steps a truck needs to wait before sending another help request
-	HelpInboxCap    = NumTrucks         //Maximum number of messages that the inbox can hold at a time
+	HelpInboxCap    = MaxTrucks         //Maximum number of messages that the inbox can hold at a time
 
 	// Maximum number of trucks allowed in the simulation (including initial ones).
 	MaxTrucks = 6
@@ -57,11 +57,127 @@ const (
 	DeployCooldown = 10
 	// Number of distinct concurrent help requests required to trigger a new truck deployment.
 	MaxConcurrentHelpRequests = 2
+	//Number of steps after which a help request no longer counts as "concurrent"
+	HelpRequestExpiry = 20
 
 	//Fuel saving parameters
-	IdleThreshold  = 5 // q consecutive timesteps without encountering/fighting a fire before returning to the department
-	MinFieldTrucks = 2 // Minimum number of trucks that must stay active in the field (can be changed to 1 for testing purposes)
+	IdleThreshold  = 5 //Number of simultation steps without fire after which the truck returns to the dept
+	MinFieldTrucks = 2 //Minimum number of trucks that must stay active in the field (can be changed to 1 for testing purposes)
 )
+
+// ----------------------------- Data structures ----------------------------------
+
+type Cell struct {
+	fire      bool
+	intensity int
+}
+
+type TruckState string
+
+const (
+	StateExtinguishing TruckState = "EXTINGUISHING"
+	StateWaiting       TruckState = "WAITING_GRANT"
+	StateHeading       TruckState = "HEADING_BACK"
+	StateRefill        TruckState = "REFILLING"
+	StateIdle          TruckState = "SAVING_FUEL" // Idling at the fire department to save fuel
+)
+type Truck struct {
+	id            string
+	x, y          int
+	water         int
+	state         TruckState
+
+	//Refill request bookkeeping.
+	refillGranted bool
+	refillRequested bool               // True once a request has been sent and no refill has completed yet
+	grantCh         chan types.Message // Grant messages from the fire department are queued here by the NATS callback
+
+	//Call-for-help bookkeeping
+	helpInbox    chan types.Message 	//Truck inbox which stores the help messages
+	isHelping    bool               	//True if this truck has agreed to help another truck
+	helpX, helpY int                	//The coordinates where help is needed
+	lastHelpStep int 					// The last simulation step when this truck sent a help request (used for cooldown calculation).
+
+	//For Fuel saving	
+	idleSteps int  						// Number of consecutive timesteps without encountering/fighting a fire.
+	isIdle    bool 						// True if the truck returned to the fire department to save fuel.
+
+	//For Lamport clocks	
+	lamportClock int 					// Lamport logical clock for this truck.
+}
+
+type World struct {
+	grid   [GridSize][GridSize]Cell
+	trucks []Truck // Changed from fixed-size array to slice to support dynamic truck additions.
+	step   int
+}
+
+//Returns a newly deployed truck object
+func spawnNewTruck(id string, x, y int) Truck {
+	return Truck {
+		id: id,
+		x: x, y: y,
+		water: TruckWaterCap,
+		state: StateExtinguishing,
+		helpInbox: make(chan types.Message, HelpInboxCap), lastHelpStep: -HelpCooldown,
+		grantCh: make(chan types.Message, 1),
+	}
+}
+
+// countActiveInField counts trucks that are not idling at (0,0) saving fuel
+func countActiveInField(w *World) int {
+	active := 0
+	for _, t := range w.trucks {
+		if !t.isIdle {
+			active++
+		}
+	}
+	return active
+}
+
+//reports whether the truck is at the fire department
+func (t *Truck) atDept() bool {
+	return t.x == DeptX && t.y == DeptY
+} 
+
+//resets the fuel-saving state
+func (t *Truck) endFuelSavingMode() {
+	t.idleSteps = 0
+	t.isIdle = false
+}
+
+//----------------------------- Lamport clocks -------------------------------------
+//Lamport clock is a counter that orders events without synchronised wall clocks
+//	1. Local event: clock++
+//	2. Sending: clock++, then attach the value to the message
+//	3. Receiving: clock = max(clock, value in message) + 1
+
+func (t *Truck) lamportTick() {
+	t.lamportClock++
+}
+
+func (t *Truck) lamportReceive(remote int) {
+	t.lamportClock = max(t.lamportClock, remote) + 1
+}
+
+func (s *FireDepartmentServer) lamportTick() {
+	s.lamportClock++
+}
+
+func (s *FireDepartmentServer) lamportReceive(remote int) {
+	s.lamportClock = max(s.lamportClock, remote) + 1
+}
+
+//tickClocks advances every lamport clock by one local event per timestamp
+func (w *World) tickClocks() {
+	server.mu.Lock()
+	server.lamportTick()
+	server.mu.Unlock()
+
+	for i := range w.trucks {
+		w.trucks[i].lamportTick()
+	}
+}
 
 // ----------------------------- Server State -------------------------------------
 
@@ -148,8 +264,8 @@ func handleRefillRequest(message *nats.Msg) {
 	server.mu.Lock()
 	defer server.mu.Unlock()
 
-	// Lamport receive rule: C = max(C, C_msg) + 1
-	server.lamportClock = max(server.lamportClock, request.LamportTime) + 1
+	// Lamport receive rule
+	server.lamportReceive(request.LamportTime)
 
 	// Ignore requests from the truck that is currently being served.
 	if server.currentTruck == request.TruckID {
@@ -178,8 +294,8 @@ func grantNext() {
 
 	next := heap.Pop(&server.queue).(refillEntry)
 
-	// Lamport send rule: increment local clock before sending a message.
-	server.lamportClock++
+	// Lamport send rule
+	server.lamportTick()
 
 	server.status = "BUSY"
 	server.currentTruck = next.TruckID
@@ -218,63 +334,6 @@ func logEvent(truckID string, lamport int, action, detail string) {
 		logFiles[truckID] = f
 	}
 	fmt.Fprintf(f, "L=%06d %-3s %-15s %s\n", lamport, truckID, action, detail)
-}
-
-// ----------------------------- Data structures ----------------------------------
-
-type Cell struct {
-	fire      bool
-	intensity int
-}
-
-type TruckState string
-
-const (
-	StateExtinguishing TruckState = "EXTINGUISHING"
-	StateWaiting       TruckState = "WAITING_GRANT"
-	StateHeading       TruckState = "HEADING_BACK"
-	StateRefill        TruckState = "REFILLING"
-	StateIdle          TruckState = "SAVING_FUEL" // Idling at the fire department to save fuel
-)
-
-type Truck struct {
-	id            string
-	x, y          int
-	water         int
-	state         TruckState
-	refillGranted bool
-
-	// Refill request bookkeeping (Part 4b).
-	refillRequested bool               // True once a request has been sent and no refill has completed yet
-	grantCh         chan types.Message // Grant messages from the fire department are queued here by the NATS callback
-
-	helpInbox    chan types.Message //Truck inbox which stores the help messages
-	isHelping    bool               //True if this truck has agreed to help another truck
-	helpX, helpY int                //The coordinates where help is needed
-
-	lastHelpStep int // The last simulation step when this truck sent a help request (used for cooldown calculation).
-
-	lamportClock int // Lamport logical clock for this truck.
-
-	idleSteps int  // Number of consecutive timesteps without encountering/fighting a fire.
-	isIdle    bool // True if the truck returned to the fire department to save fuel.
-}
-
-type World struct {
-	grid   [GridSize][GridSize]Cell
-	trucks []Truck // Changed from fixed-size array to slice to support dynamic truck additions.
-	step   int
-}
-
-// countActiveInField counts trucks that are not idling at (0,0) saving fuel
-func countActiveInField(w *World) int {
-	active := 0
-	for _, t := range w.trucks {
-		if !t.isIdle {
-			active++
-		}
-	}
-	return active
 }
 
 // ----------------------------- Fire dynamics ------------------------------------
@@ -321,6 +380,13 @@ func (w *World) spreadFires() {
 	}
 }
 
+//Decides whether to make the fire more intense or spread it or spawn new fire
+func (w *World) decideFireDynamic() {
+	if w.step % FireIntensifyEvery == 0 {w.intensifyFires()}
+	if w.step % FireSpreadEvery == 0 	{w.spreadFires()}
+	if rand.Float32() < NewFireProb		{w.addFire(rand.Intn(GridSize), rand.Intn(GridSize))}
+}
+
 // isBigFire returns true if a big fire is detected at coordinates (x, y)
 func (w *World) isBigFire(x, y int) bool {
 	if !inBounds(x, y) {
@@ -344,12 +410,6 @@ func (w *World) isBigFire(x, y int) bool {
 
 // ----------------------------- NATS Client Logic ---------------------------------
 
-// grantSubject is the per-truck reply subject the fire department publishes
-// the refill grant to, e.g. "firedept.grant.T1".
-func grantSubject(id string) string {
-	return types.GrantSubjectPrefix + id
-}
-
 // subscribeGrant makes the truck listen for its refill grant. The callback only
 // queues the message; the truck processes it (and updates its Lamport clock) in
 // act(), on the simulation goroutine. It captures the channel and not the *Truck
@@ -357,7 +417,7 @@ func grantSubject(id string) string {
 // leave a captured pointer pointing at a stale copy.
 func subscribeGrant(t *Truck) error {
 	ch := t.grantCh
-	_, err := natsConnection.Subscribe(grantSubject(t.id), func(m *nats.Msg) {
+	_, err := natsConnection.Subscribe(types.GrantSubject(t.id), func(m *nats.Msg) {
 		var msg types.Message
 		if json.Unmarshal(m.Data, &msg) != nil || msg.Type != types.RefillGrantedMessage {
 			return
@@ -374,15 +434,16 @@ func subscribeGrant(t *Truck) error {
 // timestamp. The reply subject is the truck's own grant subject, so the fire
 // department can answer later, once the request reaches the head of the queue.
 func (t *Truck) sendRefillRequest() {
-	// Lamport send rule: increment local clock before sending a message.
-	t.lamportClock++
+	// Lamport send rule
+	t.lamportTick()
+
 	request := types.Message{
 		Type:        types.RefillRequestMessage,
 		TruckID:     t.id,
 		LamportTime: t.lamportClock,
 	}
 	reqBytes, _ := json.Marshal(request)
-	natsConnection.PublishRequest(types.RefillSubject, grantSubject(t.id), reqBytes)
+	natsConnection.PublishRequest(types.RefillSubject, types.GrantSubject(t.id), reqBytes)
 	logEvent(t.id, t.lamportClock, "refill_request", "")
 }
 
@@ -395,22 +456,34 @@ func subscribeHelp(t *Truck) error {
 			return
 		}
 
-		t.lamportClock = max(t.lamportClock, msg.LamportTime) + 1 //This is adding a timestamp
 		select {
-		case t.helpInbox <- msg: //If the message can be added to the inbox without having to wait (i.e. inbox not full), then queue the message
-		default: //If the inbox is full and the message has to wait, just skip it/ ignore it.
+			case t.helpInbox <- msg: //If the message can be added to the inbox without having to wait (i.e. inbox not full), then queue the message
+			default: //If the inbox is full and the message has to wait, just skip it/ ignore it.
 		}
 	})
 	return err
 }
 
+//Subscribe the trucks to both grant and help topic 
+func subscribeTruckToAllSubjects(t *Truck) error {
+	if err := subscribeHelp(t); err != nil 	{
+		return fmt.Errorf("help subject: %w", err)
+	}
+	if err := subscribeGrant(t); err != nil {
+		return fmt.Errorf("grant subject: %w", err)
+	}
+	return nil
+}
+
 // Method called to publish help request with lamport clock
 func (t *Truck) publishHelp(x, y int) {
 	//also increment clock before sending a message
-	t.lamportClock++
+	t.lamportTick()
+
 	msg := types.Message{
 		Type:        types.HelpRequestMessage,
 		TruckID:     t.id,
+		FireID: 	 types.FireName(x, y),	
 		X:           x,
 		Y:           y,
 		LamportTime: t.lamportClock,
@@ -424,6 +497,8 @@ func (t *Truck) handleHelpRequest() {
 	for {
 		select {
 		case m := <-t.helpInbox:
+			t.lamportReceive(m.LamportTime) //Lamport receive rule
+
 			if m.TruckID == t.id || t.isHelping { //if the help is sent by itself or if it is already helping another truck
 				continue
 			}
@@ -433,8 +508,7 @@ func (t *Truck) handleHelpRequest() {
 			if t.water >= HelpMinWater && !t.refillGranted && dist <= HelpMaxDistance {
 				t.isHelping, t.helpX, t.helpY = true, m.X, m.Y
 
-				t.isIdle = false //If the truck is helping, it cannot be idling at the fire department to save fuel
-				t.idleSteps = 0  //Reset the idle steps counter since the truck is helping
+				t.endFuelSavingMode() //If the truck is helping, it cannot be idling at the fire department to save fuel
 			}
 		default:
 			return
@@ -450,7 +524,7 @@ func (t *Truck) move(w *World, dir string) {
 	ox, oy := t.x, t.y
 	defer func() {
 		if t.x != ox || t.y != oy {
-			t.lamportClock++
+			t.lamportTick()
 			logEvent(t.id, t.lamportClock, "move", fmt.Sprintf("(%d,%d)->(%d,%d)", ox, oy, t.x, t.y))
 		}
 	}()
@@ -508,7 +582,7 @@ func (t *Truck) extinguish(w *World) {
 		c.intensity = 0
 	}
 	// Extinguishing is a local event: tick the Lamport clock and log it.
-	t.lamportClock++
+	t.lamportTick()
 	logEvent(t.id, t.lamportClock, "extinguish", fmt.Sprintf("(%d,%d) intensity=%d", t.x, t.y, c.intensity))
 }
 
@@ -532,82 +606,76 @@ func (t *Truck) detectBigFire(w *World) (int, int, bool) {
 
 }
 
-func (t *Truck) act(w *World) {
-	t.handleHelpRequest()
+func (t *Truck) goRefill(w * World) {
+	t.isHelping = false //If the water level has reached 0, the trucks cannot offer help
+	t.isIdle = false    //If the truck is heading back to refill, it cannot be idling at the fire department to save fuel
 
-	// A truck needs water if it is at 0 or still in the process of refilling
-	if t.water == 0 || t.refillGranted {
-		t.isHelping = false //If the water level has reached 0, the trucks cannot offer help
-		t.isIdle = false    //If the truck is heading back to refill, it cannot be idling at the fire department to save fuel
-
-		// If at (0,0) with grant, remain stationary until full
-		if t.x == DeptX && t.y == DeptY && t.refillGranted {
-			t.state = StateRefill
-			return
-		}
-
-		// Send exactly ONE refill request; the fire department queues it and
-		// replies when this truck reaches the head of the queue.
-		if !t.refillRequested {
-			t.sendRefillRequest()
-			t.refillRequested = true
-		}
-
-		// Check (without blocking) whether the grant has arrived.
-		if !t.refillGranted {
-			select {
-			case g := <-t.grantCh:
-				// Lamport receive rule: C = max(C, C_msg) + 1
-				t.lamportClock = max(t.lamportClock, g.LamportTime) + 1
-				t.refillGranted = true
-				t.state = StateHeading
-				logEvent(t.id, t.lamportClock, "refill_granted", "")
-			default:
-				t.state = StateWaiting
-			}
-		}
-
-		// Already at the station: wait here (or start refilling next step)
-		// instead of wandering off, since toward() returns a random direction
-		// when the truck is already at its target.
-		if t.x == DeptX && t.y == DeptY {
-			return
-		}
-
-		// Move towards firestation regardless of grant status
-		t.move(w, toward(t.x, t.y, DeptX, DeptY))
+	// If at (0,0) with grant, remain stationary until full
+	if t.atDept() && t.refillGranted {
+		t.state = StateRefill
 		return
 	}
 
-	// Behaviour implemented when water > 0
-	t.state = StateExtinguishing
-	t.refillGranted = false
-	t.refillRequested = false
+	// Send exactly ONE refill request; the fire department queues it and
+	// replies when this truck reaches the head of the queue.
+	if !t.refillRequested {
+		t.sendRefillRequest()
+		t.refillRequested = true
+	}
 
+	// Check (without blocking) whether the grant has arrived.
+	if !t.refillGranted {
+		select {
+		case g := <-t.grantCh:
+			// Lamport receive rule: C = max(C, C_msg) + 1
+			t.lamportReceive(g.LamportTime)
+
+			t.refillGranted = true
+			t.state = StateHeading
+			logEvent(t.id, t.lamportClock, "refill_granted", "")
+		default:
+			t.state = StateWaiting
+		}
+	}
+
+	// Already at the station: wait here (or start refilling next step)
+	// instead of wandering off, since toward() returns a random direction
+	// when the truck is already at its target.
+	if t.atDept() {
+		return
+	}
+
+	// Move towards firestation regardless of grant status
+	t.move(w, toward(t.x, t.y, DeptX, DeptY))
+}
+
+func (t *Truck) callForHelpIfBigFire(w *World) {
 	// Call for help when a big fire is detected
 	if bx, by, ok := t.detectBigFire(w); ok && w.step-t.lastHelpStep >= HelpCooldown {
 		t.publishHelp(bx, by)
 		t.lastHelpStep = w.step
 	}
+}
 
-	//Navigation for Assitance
+func (t *Truck) driveToHelp(w *World) bool { //returns true is the truck used its turn to 
 	if t.isHelping && !w.grid[t.helpX][t.helpY].fire { //If the fire is out at the location, then no need to help out
 		t.isHelping = false
 	}
 
 	if t.isHelping && (t.x != t.helpX || t.y != t.helpY) { //If the truck has not reached the help location, move towards the help location
-		t.idleSteps = 0
-		t.isIdle = false
+		t.endFuelSavingMode()
 		t.move(w, toward(t.x, t.y, t.helpX, t.helpY))
-		return
+		return true
 	}
+	return false
+}
 
+func (t *Truck) fightFire(w *World) bool { //it returns true if the truck used it's turn to extinguish the fire
 	//Extinguising fire on current cell
 	if w.grid[t.x][t.y].fire {
-		t.idleSteps = 0 //Reset idle steps when encountering a fire
-		t.isIdle = false
+		t.endFuelSavingMode()
 		t.extinguish(w)
-		return
+		return true
 	}
 
 	//Move towards nearest fire anywhere on the grid
@@ -616,16 +684,20 @@ func (t *Truck) act(w *World) {
 		t.idleSteps = 0 //Reset idle steps when moving towards a fire
 		t.isIdle = false
 		t.move(w, toward(t.x, t.y, fx, fy))
-		return
+		return true
 	}
 
+	return false
+}
+
+func (t *Truck) idleOrPatrol(w *World) {
 	t.idleSteps++ //Increment idle steps when no fire is detected and the truck is not moving towards a fire
 
 	//If no fire encountered for q consecutive timestamps
 	if t.idleSteps >= IdleThreshold {
 
 		// If already idling at the station, stays there until a new fire is detected
-		if t.isIdle && t.x == DeptX && t.y == DeptY {
+		if t.isIdle && t.atDept() {
 			t.state = StateIdle
 			return
 		}
@@ -633,7 +705,7 @@ func (t *Truck) act(w *World) {
 		// Check if returning would leave at least MinFieldTrucks active
 		if countActiveInField(w) > MinFieldTrucks {
 			// Check if we just reached the station (0,0)
-			if t.x == DeptX && t.y == DeptY {
+			if t.atDept() {
 				t.isIdle = true
 				t.state = StateIdle // Only becomes SAVING_FUEL at (0,0)
 				return
@@ -651,6 +723,31 @@ func (t *Truck) act(w *World) {
 	t.isIdle = false
 	t.state = StateExtinguishing
 	t.move(w, randomDir())
+}
+
+func (t *Truck) act(w *World) {
+	t.handleHelpRequest()
+
+	// A truck needs water if it is at 0 or still in the process of refilling
+	if t.water == 0 || t.refillGranted {
+		t.goRefill(w)
+		return
+	}
+
+	// Behaviour implemented when water > 0
+	t.state = StateExtinguishing
+	t.refillGranted = false
+	t.refillRequested = false
+
+	t.callForHelpIfBigFire(w)
+
+	//Check if the truck can use its turn to help other truck or extinguish fire
+	if t.driveToHelp(w) || t.fightFire(w) {
+		return //If the turn has been used, end
+	}
+
+	//Else check if the truck needs to go into idle mode or continue patroling
+	t.idleOrPatrol(w)
 }
 
 // ----------------------------- Refill Service -----------------------------------
@@ -671,7 +768,7 @@ func serviceStationRefill(w *World) {
 		t := &w.trucks[i]
 		if t.id == server.currentTruck {
 			// Can only refill at the fire department (0,0) and grant permit
-			if t.x == DeptX && t.y == DeptY && t.refillGranted {
+			if t.atDept() && t.refillGranted {
 				t.water += RefillRate
 
 				// Close connection when completely refilled
@@ -688,6 +785,74 @@ func serviceStationRefill(w *World) {
 			}
 			break
 		}
+	}
+}
+
+// ----------------------------- Truck deployment ---------------------------------
+
+//Deploy monitor listens to the help subject and deploys a new truck when the required amount of trucks have called for help concurrently
+type deployMonitor struct {
+	requests		chan string 	//IDs of trucks that called for help, filled by the NATS callback
+	recent			map[string]int	//truckID -> step of its latest help call
+	lastDeployStep	int
+}
+
+func newDeployMonitor() (*deployMonitor, error) {
+	d := &deployMonitor{
+		requests: make(chan string, 100),
+		recent:	make(map[string]int),
+		lastDeployStep: -DeployCooldown,	
+	}
+
+	requests := d.requests
+	_, err := natsConnection.Subscribe(types.HelpSubject, func(m *nats.Msg) { //Subscribe to the help subject and listen to how many trucks are calling for help
+		var msg types.Message
+
+		if json.Unmarshal(m.Data, &msg) != nil || msg.Type != types.HelpRequestMessage {
+			return
+		}
+
+		select {
+			case requests <- msg.TruckID:
+			default:
+		}
+	})
+	return d, err	
+}
+
+//updates the requests by deleting old help requests or deploying trucks if needed
+func (d *deployMonitor) handleConcurrentRequests(w *World) {
+	//Forget help requests that are too old to count as concurrent
+	for id, step := range d.recent {
+		if w.step - step > HelpRequestExpiry {delete(d.recent, id)}
+	}
+
+	select {
+		case truckID := <- d.requests:
+			d.recent[truckID] = w.step
+
+			if 	len(d.recent) >= MaxConcurrentHelpRequests &&
+				len(w.trucks) < MaxTrucks &&
+				w.step - d.lastDeployStep >= DeployCooldown {
+					deployTruck(w)
+					d.lastDeployStep = w.step
+					d.recent = make(map[string]int)
+				}
+
+		default:
+	}
+}
+
+//adds a new truck (T3, T4, ....) at the fire dept and subscribes it to all its subjects
+func deployTruck(w *World) {
+	worldMutex.Lock()
+	defer worldMutex.Unlock()
+
+	newID := fmt.Sprintf("T%d", len(w.trucks)+1)
+	w.trucks = append(w.trucks, spawnNewTruck(newID, DeptX, DeptY))
+
+	if err := subscribeTruckToAllSubjects(&w.trucks[len(w.trucks) - 1]); err != nil {
+		fmt.Printf("Could not subscribe %s: %v\n", newID, err)
 	}
 }
 
@@ -710,6 +875,12 @@ func nearestFire(w *World, x, y int) (int, int, bool) {
 }
 
 func occupied(w *World, x, y int, skipID string) bool {
+	// The fire department can hold any number of trucks.
+	// Without this, a truck waiting for its grant (or idling) at (0,0)
+	// can block the truck that actually holds the grant -> deadlock.
+	if x == DeptX && y == DeptY {
+		return false
+	}
 	for _, t := range w.trucks {
 		if t.id != skipID && t.x == x && t.y == y {
 			return true
@@ -843,55 +1014,24 @@ func main() {
 
 	w := World{
 		trucks: []Truck{ // Slice instead of array, so we can append new trucks at runtime.
-			{
-				id: "T1", x: 0, y: 2, water: TruckWaterCap, state: StateExtinguishing,
-				helpInbox: make(chan types.Message, HelpInboxCap), lastHelpStep: -HelpCooldown,
-				grantCh: make(chan types.Message, 1),
-			},
-			{
-				id: "T2", x: 5, y: 5, water: TruckWaterCap, state: StateExtinguishing,
-				helpInbox: make(chan types.Message, HelpInboxCap), lastHelpStep: -HelpCooldown,
-				grantCh: make(chan types.Message, 1),
-			},
+			spawnNewTruck("T1", 0, 2),
+			spawnNewTruck("T2", 5, 5),
 		},
 	}
 
 	//Subscribe all trucks to the help topic and to their own grant subject
 	for i := range w.trucks {
-		if err := subscribeHelp(&w.trucks[i]); err != nil {
-			fmt.Printf("Could not subscribe to help subject")
-			return
-		}
-		if err := subscribeGrant(&w.trucks[i]); err != nil {
-			fmt.Printf("Could not subscribe to grant subject")
+		if err := subscribeTruckToAllSubjects(&w.trucks[i]); err != nil {
+			fmt.Printf("could not subscribe %s: %v\n", w.trucks[i].id, err)
 			return
 		}
 	}
 
-	// Channel used by the NATS callback to notify the main loop of help requests.
-	deployRequestChan := make(chan string, 100)
-
-	// Subscribe to the help subject solely for the purpose of truck deployment.
-	// Every help request is forwarded to deployRequestChan.
-	_, err = natsConnection.Subscribe(types.HelpSubject, func(m *nats.Msg) {
-		var msg types.Message
-		if json.Unmarshal(m.Data, &msg) != nil || msg.Type != types.HelpRequestMessage {
-			return
-		}
-		select {
-		case deployRequestChan <- msg.TruckID:
-		default:
-		}
-	})
+	deployMonitor, err := newDeployMonitor()
 	if err != nil {
-		fmt.Printf("Could not subscribe to help subject for deployment")
+		fmt.Printf("could not subscribe for truck deployment: %v\n", err)
 		return
 	}
-
-	// Tracks which trucks have requested help recently, to avoid double-counting
-	// the same truck and to measure concurrent help requests.
-	activeHelpRequests := make(map[string]int)
-	lastDeployStep := -DeployCooldown
 
 	w.addFire(0, 11)
 	w.addFire(11, 7)
@@ -900,61 +1040,11 @@ func main() {
 	for {
 		w.step++
 
-		//increment on every local event as lamport clock, one per step
-
-		server.mu.Lock()
-		server.lamportClock++
-		server.mu.Unlock()
-		for i := range w.trucks {
-			w.trucks[i].lamportClock++
-		}
-
-		if w.step%FireIntensifyEvery == 0 {
-			w.intensifyFires()
-		}
-		if w.step%FireSpreadEvery == 0 {
-			w.spreadFires()
-		}
-		if rand.Float32() < NewFireProb {
-			w.addFire(rand.Intn(GridSize), rand.Intn(GridSize))
-		}
-
-		// Remove help requests that are older than 20 simulation steps.
-		// This keeps the active help request count relevant and up-to-date.
-		for id, step := range activeHelpRequests {
-			if w.step-step > 20 {
-				delete(activeHelpRequests, id)
-			}
-		}
-
-		// Check for new help requests and deploy a new truck if conditions are met:
-		// - At least MaxConcurrentHelpRequests distinct trucks have requested help concurrently.
-		// - Total number of trucks is below MaxTrucks.
-		// - Enough simulation steps have passed since the last deployment (DeployCooldown).
-		select {
-		case truckID := <-deployRequestChan:
-			activeHelpRequests[truckID] = w.step
-			if len(activeHelpRequests) >= MaxConcurrentHelpRequests && len(w.trucks) < MaxTrucks && w.step-lastDeployStep >= DeployCooldown {
-				worldMutex.Lock()
-				newID := fmt.Sprintf("T%d", len(w.trucks)+1) // Generate T3, T4, T5, ...
-				newTruck := Truck{
-					id: newID, x: DeptX, y: DeptY, water: TruckWaterCap, state: StateExtinguishing,
-					helpInbox: make(chan types.Message, HelpInboxCap), lastHelpStep: -HelpCooldown,
-					grantCh: make(chan types.Message, 1),
-				}
-				w.trucks = append(w.trucks, newTruck)
-				go subscribeHelp(&w.trucks[len(w.trucks)-1]) // Subscribe the new truck to help messages.
-				subscribeGrant(&w.trucks[len(w.trucks)-1])   // Subscribe the new truck to its refill grant subject.
-				lastDeployStep = w.step
-				activeHelpRequests = make(map[string]int) // Reset the concurrent help counter.
-				worldMutex.Unlock()
-			}
-		default:
-		}
+		w.tickClocks() //increment on every local event as lamport clock, one per step
+		w.decideFireDynamic()
+		deployMonitor.handleConcurrentRequests(&w) //decides whether to deploy new trucks or delete old requests
 
 		// Trucks act: request a refill, wait for the grant, navigate home, or extinguish.
-		// Protect the trucks slice while iterating and updating truck states,
-		// because new trucks may be appended by the deployment logic above.
 		worldMutex.Lock()
 		for i := range w.trucks {
 			w.trucks[i].act(&w)
