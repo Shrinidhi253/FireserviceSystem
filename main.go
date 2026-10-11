@@ -380,6 +380,13 @@ func (w *World) spreadFires() {
 	}
 }
 
+//Decides whether to make the fire more intense or spread it or spawn new fire
+func (w *World) decideFireDynamic() {
+	if w.step % FireIntensifyEvery == 0 {w.intensifyFires()}
+	if w.step % FireSpreadEvery == 0 	{w.spreadFires()}
+	if rand.Float32() < NewFireProb		{w.addFire(rand.Intn(GridSize), rand.Intn(GridSize))}
+}
+
 // isBigFire returns true if a big fire is detected at coordinates (x, y)
 func (w *World) isBigFire(x, y int) bool {
 	if !inBounds(x, y) {
@@ -971,18 +978,8 @@ func main() {
 	for {
 		w.step++
 
-		//increment on every local event as lamport clock, one per step
-		w.tickClocks()
-
-		if w.step%FireIntensifyEvery == 0 {
-			w.intensifyFires()
-		}
-		if w.step%FireSpreadEvery == 0 {
-			w.spreadFires()
-		}
-		if rand.Float32() < NewFireProb {
-			w.addFire(rand.Intn(GridSize), rand.Intn(GridSize))
-		}
+		w.tickClocks() //increment on every local event as lamport clock, one per step
+		w.decideFireDynamic()
 
 		// Remove help requests that are older than HelpRequestExpiry simulation steps.
 		// This keeps the active help request count relevant and up-to-date.
