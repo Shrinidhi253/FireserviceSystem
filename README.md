@@ -139,7 +139,7 @@ Some limitations that will be worked on are as follows:
 
 
 ## Team
-1. Ifty Zubaer
-2. Josefina Faundez Reyes
-3. Lei Zhou
-4. Shrinidhi Ganapathi
+1. [Ifty Zubaer](https://github.com/iftyzubaer)
+2. [Josefina Faundez Reyes](https://github.com/jojosefin)
+3. [Lei Zhou](https://github.com/wyattchaul-517)
+4. Shrinidhi Ganapathi (Me :D)
