@@ -55,7 +55,3 @@ The number of timesteps can be changed in `main.go` by setting `simTimesteps` va
 2. Josefina Faundez Reyes
 3. Lei Zhou
 4. Shrinidhi Ganapathi
-
-<hr>
-
-![Fighting forest fires](firetrucks_comic.png)
